@@ -15,6 +15,7 @@ import json
 import socket
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from loguru import logger
@@ -171,7 +172,8 @@ function showError(msg,trace,q){
     '错误: '+msg];
   if(trace&&trace.length)lines.push('Traceback:',...trace);
   lines.push('====================================',
-    '把以上内容完整粘贴给 WorkBuddy 对话，即可获得修复方案。');
+    '本报告已自动保存到 data/debug/last_error.txt。',
+    '打开 WorkBuddy 说「修复上次的错误」即可，无需复制粘贴。');
   lastReport=lines.join('\n');
   const box=document.createElement('div');box.className='errbox';
   box.innerHTML=
@@ -200,7 +202,7 @@ async function copyReport(btn){
 function goWorkbuddy(btn){
   copyReport(btn).then(()=>{
     const box=btn.closest('.errbox');const c=box.querySelector('.copied');
-    c.textContent='✅ 已复制！打开 WorkBuddy 对话，直接粘贴即可获得修复方案';
+    c.textContent='✅ 已复制！到 WorkBuddy 说「修复上次的错误」，或直接粘贴此报告';
     c.style.display='block';
     if(box.scrollIntoView)box.scrollIntoView({behavior:'smooth',block:'nearest'});
   });
@@ -326,6 +328,23 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     # ── 调试模式: 错误报告 ────────────────────────────────
+    debug_dir: str = ""  # serve() 里赋值为 data/debug，报错自动落盘
+
+    def _dump_error(self, text: str):
+        """错误报告落盘到 data/debug/last_error.txt（固定文件名，WorkBuddy 可直接读取）。
+
+        用户侧闭环：Web 页面报错 → 自动存盘 → 打开 WorkBuddy 说
+        「修复上次的错误」→ 直接读此文件定位修复，无需复制粘贴。"""
+        if not self.debug or not self.debug_dir:
+            return
+        try:
+            p = Path(self.debug_dir) / "last_error.txt"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+            logger.warning(f"错误报告已落盘: {p}")
+        except Exception:
+            pass  # 落盘失败不影响主流程
+
     def _err_body(self, where: str, exc: Exception) -> dict:
         """构造错误响应体。调试模式携带完整 traceback, 生产模式只给消息。"""
         import traceback as tb
@@ -334,6 +353,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.debug:
             body["trace"] = tb.format_exc().splitlines()
             body["debug"] = True
+            self._dump_error(self._report_text("", exc, self.path))
         return body
 
     def _report_text(self, q: str, exc: Exception, path: str = "") -> str:
@@ -351,7 +371,8 @@ class Handler(BaseHTTPRequestHandler):
         ]
         lines += tb.format_exc().splitlines()
         lines.append("====================================")
-        lines.append("把以上内容完整粘贴给 WorkBuddy 即可获得修复方案。")
+        lines.append("本报告已自动保存到 data/debug/last_error.txt。")
+        lines.append("打开 WorkBuddy 说「修复上次的错误」即可，无需复制粘贴。")
         return "\n".join(lines)
 
     def _html(self, body: bytes):
@@ -437,6 +458,7 @@ class Handler(BaseHTTPRequestHandler):
             logger.warning(f"问答失败: {e}")
             try:
                 if self.debug:
+                    self._dump_error(self._report_text(q, e, self.path))
                     self._sse({"type": "error", "message": f"AI 回答失败：{e}",
                                "trace": __import__("traceback").format_exc().splitlines(),
                                "q": q, "path": self.path})
@@ -521,6 +543,7 @@ def serve(cfg: Config) -> int:
     Handler.db_path = str(cfg.path("paths.db"))
     Handler.answerer = _build_answerer(cfg)
     Handler.debug = bool(cfg.get("serve.debug", False))  # 调试模式(错误详情+跳转修复)
+    Handler.debug_dir = str(cfg.path("paths.data_dir") / "debug")  # 错误报告落盘目录
 
     host = cfg.get("serve.host", "0.0.0.0")
     port = int(cfg.get("serve.port", 8765))
