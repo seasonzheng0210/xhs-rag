@@ -111,6 +111,21 @@ Web UI 检索后会用 LLM 基于命中的片段生成回答，流式输出，�
 - 回归验证：`PYTHONPATH=src python scripts/_qa_usage_test.py`（秋葵/沙茶酱/山药三个 case，
   断言回答保留具体用量，可 `... shacha` 只跑单个）。
 
+## 性能优化（检索 35-75s → 9-14s）
+
+i5-5200U 双核 CPU 上，检索链路实测优化前 35-75s、优化后 9-14s（重复问题缓存命中 0s）。三板斧：
+
+1. **OCR 噪声清洗**（`chunk.clean_ocr_noise`）：视频帧 OCR 的 `<|LOC_n|>` 定位标记、纯 emoji 装饰行、
+   纯字母乱码串在**分块时**剔除（保守策略，数字数据行/中英混合行保留）。重建索引后 LOC 标记 62→0，
+   chunks 234→218。`vault/` 原始 Markdown 不动，只影响索引。
+2. **rerank 候选裁剪**：候选数必须由配置 `rerank.top_k_in` 控制（曾因 `max(top_k_out*4, cfg)` 在 k=5
+   时强制 20 候选，每对 ~1.2s CPU 推理拖垮检索）；打分截断 160 字符。
+3. **缓存**：query 编码缓存（embedder 内建）+ 检索结果 LRU 缓存（`rerank.cache_ttl`，默认 5 分钟），
+   重复提问秒回。
+
+配套：`retriever.warmup()` 在服务启动时预热 embedder + reranker（首次查询不再等模型加载）；
+`/api/health` 健康检查端点（Docker healthcheck 用，不触发模型推理）。
+
 ## 调试模式（所有 Web 项目标配）
 
 报错时页面显示错误卡片，三个操作：**查看错误详情**（完整 traceback，可展开/收起）、**复制错误报告**、**去 WorkBuddy 修复**。

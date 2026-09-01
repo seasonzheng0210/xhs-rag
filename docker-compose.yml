@@ -20,3 +20,10 @@ services:
     restart: unless-stopped
     # 模型预热占内存: embedder(~2GB) + reranker(~2GB), 4GB 内存可跑, 8GB 更稳
     mem_limit: 8g
+    # 健康检查: /api/health 秒回不触发模型推理
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s  # 首次启动含模型预热, 给足宽限

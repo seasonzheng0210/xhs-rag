@@ -263,6 +263,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     retriever: Retriever = None
     db: DB = None
+    started_at: float = time.time()
     db_path: str = ""
     answerer = None  # qa.Answerer，未配置则 None
     debug: bool = False  # 调试模式: 错误响应携带完整 traceback, 前端可查看/复制/跳 WorkBuddy
@@ -403,6 +404,22 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_answer(url)
         elif url.path == "/api/stats":
             self._json(self._stats())
+        elif url.path == "/api/health":
+            # 健康检查: Docker healthcheck / 监控探活。不触发模型推理, 秒回。
+            try:
+                lancedb = __import__("lancedb")
+                tbl = lancedb.connect(str(
+                    self.retriever.lance_dir)).open_table(self.retriever.table_name)
+                chunks = tbl.count_rows()
+            except Exception:
+                chunks = -1
+            self._json({
+                "status": "ok",
+                "chunks": chunks,
+                "llm": self.answerer.provider if getattr(self, "answerer", None) else None,
+                "debug": bool(getattr(self, "debug", False)),
+                "uptime_secs": round(time.time() - self.started_at),
+            })
         else:
             # HTTP/1.1 下必须给 Content-Length，否则客户端会一直等 body
             self.send_response(404)
