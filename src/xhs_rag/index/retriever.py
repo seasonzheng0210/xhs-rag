@@ -89,13 +89,16 @@ class Retriever:
         for hit, score in ranked:
             results.append({
                 "note_id": hit["note_id"],
+                # seq 必须带上: _complete_note_chunks 用它做去重 key,
+                # 缺了会退化成 (note_id, None) 导致同笔记多条 top5 重复补全
+                "seq": hit.get("seq"),
                 "title": hit["title"],
                 "section": hit.get("section", ""),
                 "text": hit["text"],
                 "score": round(float(score), 4),
                 "url": self._note_url(hit["note_id"]),
             })
-        return self._complete_note_chunks(results)
+        return self._complete_note_chunks(hits, results)
 
     def _note_url(self, note_id: str) -> str:
         """查笔记 url,db 不可用时留空(不影响检索)。"""
@@ -107,38 +110,44 @@ class Retriever:
         except Exception:
             return ""
 
-    def _complete_note_chunks(self, results: list[dict]) -> list[dict]:
+    def _complete_note_chunks(self, candidates: list[dict],
+                              results: list[dict]) -> list[dict]:
         """同笔记补全: topN 结果所属笔记的其他 chunk 追加到尾部。
 
-        用全表快照过滤(表只有几百行,毫秒级),避免 lancedb 复杂查询语法。
-        补全 chunk 的 score 记 0.0,靠 seq 排序保持笔记内原始顺序。
+        只在 top_k_in 向量候选里补(候选是"相关但没进 top5"的同笔记片段),
+        不从全表拉——长视频笔记可能切几十个帧 OCR chunk, 全拉会污染上下文。
+        每笔记最多补 max_per_note 条, 按候选顺序取最相关的。
         """
         if not results:
             return results
-        try:
-            import pyarrow as pa
-            df = self._get_table().to_arrow().to_pandas()
-        except Exception as e:
-            logger.warning(f"同笔记补全失败(跳过): {e}")
-            return results
+        max_per_note = 3
+        # note_id -> 按候选顺序(即相关性序)的 chunk 列表
+        by_note: dict[str, list[dict]] = {}
+        for h in candidates:
+            by_note.setdefault(h["note_id"], []).append(h)
 
         seen = {(r["note_id"], r.get("seq")) for r in results}
         extra: list[dict] = []
+        note_added: dict[str, int] = {}  # 按笔记维度计数,避免同笔记多条 top5 重复补
         for r in results:  # 保持 rerank 顺序,逐个笔记补全
-            note_df = df[df["note_id"] == r["note_id"]]
-            for _, row in note_df.sort_values("seq").iterrows():
-                key = (row["note_id"], int(row.get("seq") or 0))
+            note = r["note_id"]
+            url = r["url"]
+            for h in by_note.get(note, []):
+                if note_added.get(note, 0) >= max_per_note:
+                    break
+                key = (h["note_id"], h.get("seq"))
                 if key in seen:
                     continue
                 seen.add(key)
                 extra.append({
-                    "note_id": row["note_id"],
-                    "title": row.get("title") or r["title"],
-                    "section": row.get("section") or "",
-                    "text": row.get("text") or "",
+                    "note_id": h["note_id"],
+                    "title": h.get("title") or r["title"],
+                    "section": h.get("section") or "",
+                    "text": h.get("text") or "",
                     "score": 0.0,
-                    "url": r["url"],
+                    "url": url,
                 })
+                note_added[note] = note_added.get(note, 0) + 1
         return results + extra
 
     def _rerank(self, query: str, candidates: list[str]) -> list[float | None]:
