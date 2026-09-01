@@ -103,6 +103,13 @@ Web UI 检索后会用 LLM 基于命中的片段生成回答，流式输出，�
   RAG 问答用不上推理链，代码里显式发了 `{"thinking": {"type": "disabled"}}`。
 - 未配 key 或接口异常时**优雅降级**：照常展示检索结果，只多一条提示，不报错。
 - 想完全本地可把 `llm.provider` 改成 `ollama` 走本地模型（2 核机器上会很慢）。
+- **回答准确性（配方/用量类）**：做过两层加固——
+  1. SYSTEM_PROMPT 强制「片段中的具体数字（用量/时间/比例）必须原样保留」，配方/做法类必须写出具体用量；
+  2. 检索侧做**同笔记补全**（`retriever._complete_note_chunks`）：配方类笔记的用量常在图 OCR chunk 里，
+     rerank 只用前 200 字符打分，OCR 噪声开头会让它被挤出 top5，补全保证「笔记有一个 chunk 进 topN，
+     其他 chunk 一并喂给 LLM」。每笔记最多补 3 条，只在向量候选里补。
+- 回归验证：`PYTHONPATH=src python scripts/_qa_usage_test.py`（秋葵/沙茶酱/山药三个 case，
+  断言回答保留具体用量，可 `... shacha` 只跑单个）。
 
 ## 调试模式（所有 Web 项目标配）
 
