@@ -174,7 +174,7 @@ function showError(msg,trace,q){
   lines.push('====================================',
     '本报告已自动保存到 data/debug/last_error.txt。',
     '打开 WorkBuddy 说「修复上次的错误」即可，无需复制粘贴。');
-  lastReport=lines.join('\n');
+  lastReport=lines.join('\\n');
   const box=document.createElement('div');box.className='errbox';
   box.innerHTML=
     '<div class="msg">⚠️ '+esc(msg)+'</div>'+
@@ -183,7 +183,7 @@ function showError(msg,trace,q){
       '<button onclick="copyReport(this)">复制错误报告</button>'+
       '<button onclick="goWorkbuddy(this)">去 WorkBuddy 修复</button>'+
     '</div>'+
-    '<div class="trace"><pre>'+esc(trace?trace.join('\n'):'(无 traceback，请查看 data/logs/xhs-rag.log)')+'</pre></div>'+
+    '<div class="trace"><pre>'+esc(trace?trace.join('\\n'):'(无 traceback，请查看 data/logs/xhs-rag.log)')+'</pre></div>'+
     '<div class="copied"></div>';
   $('#answer-box').appendChild(box);
 }
