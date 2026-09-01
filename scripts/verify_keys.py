@@ -66,6 +66,8 @@ PROVIDERS = {
         "prefix": "",
         "embedding": "embedding-3",
         "rerank": "rerank",
+        # 智谱 rerank 分数不极化（相关 1.0 / 不相关 0.9987），只验证排序不查区分度
+        "rerank_min_gap": 0,
         "watch_models": ["glm-4v-flash"],
     },
 }
@@ -127,13 +129,16 @@ def test_embedding(base: str, key: str, model: str):
     return True, f"dim={dim}, tokens={usage}, {ms}ms"
 
 
-def test_rerank(base: str, key: str, model: str):
+def test_rerank(base: str, key: str, model: str, min_gap: float = 0.5):
     """
     用「强相关 / 强不相关」对照对验证，并检查排序与分数可分性。
 
     ★ 实测结论（2026-08-30，硅基流动 bge-reranker-v2-m3）：
       分数是 sigmoid 归一化到 [0,1]，且两极化 —— 强相关 0.9997 / 不相关 0.000016。
       因此检索时**只能用相对排序，不能设绝对阈值**（设 0.5 会大量误杀）。
+
+    ★ 2026-09-01 实测：智谱 rerank 分数分布不同（相关 1.0 / 不相关 0.9987），
+      不极化、普遍贴近 1 —— 对智谱设 min_gap=0 只验证排序正确，不检查区分度。
     """
     docs = ["苹果是一种水果", "今天股市大涨"]
     ok, status, data, ms = http_json(
@@ -151,7 +156,7 @@ def test_rerank(base: str, key: str, model: str):
 
     if top1 != 0:
         return False, f"排序错误：top1 命中不相关文档（{scores}）"
-    if scores.get(0, 0) - scores.get(1, 1) < 0.5:
+    if scores.get(0, 0) - scores.get(1, 1) < min_gap:
         return False, f"分数区分度不足，rerank 可能未生效（{scores}）"
     return True, (f"排序正确，区分度 {scores[0]:.4f} vs {scores[1]:.6f}，{ms}ms"
                   f"（sigmoid 归一化，勿设绝对阈值）")
@@ -302,7 +307,8 @@ def main():
         print(f"  {OK if ok_emb else FAIL} Embedding  {cfg['embedding']}")
         print(f"         {msg_emb}")
 
-        ok_rer, msg_rer = test_rerank(cfg["base"], key, cfg["rerank"])
+        ok_rer, msg_rer = test_rerank(cfg["base"], key, cfg["rerank"],
+                                      min_gap=cfg.get("rerank_min_gap", 0.5))
         print(f"  {OK if ok_rer else FAIL} Rerank     {cfg['rerank']}")
         print(f"         {msg_rer}")
 
