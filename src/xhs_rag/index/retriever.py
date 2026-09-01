@@ -61,7 +61,13 @@ class Retriever:
         return self._reranker
 
     def search(self, query: str, k: int | None = None) -> list[dict]:
-        """检索并重排,返回 [{note_id, title, section, text, score, url}]。"""
+        """检索并重排,返回 [{note_id, title, section, text, score, url}]。
+
+        返回前做同笔记补全: rerank 只用片段前 200 字符打分,
+        配方/做法类笔记的用量常在图 OCR chunk 里(开头是 OCR 噪声,打分极低),
+        会被挤出 topN 导致 LLM 看不到关键数字。因此只要某笔记有一个
+        chunk 进 topN,就把它在库里的其他 chunk 一并补进结果尾部。
+        """
         top_k_out = k or self.top_k_out
         top_k_in = max(top_k_out * 4, self.top_k_in)
 
@@ -81,22 +87,59 @@ class Retriever:
 
         results = []
         for hit, score in ranked:
-            url = ""
-            if self.db is not None:
-                try:  # 跨线程/连接失效时 url 留空,不影响检索
-                    note = self.db.get_note(hit["note_id"])
-                    url = note.get("url", "") if note else ""
-                except Exception:
-                    url = ""
             results.append({
                 "note_id": hit["note_id"],
                 "title": hit["title"],
                 "section": hit.get("section", ""),
                 "text": hit["text"],
                 "score": round(float(score), 4),
-                "url": url,
+                "url": self._note_url(hit["note_id"]),
             })
-        return results
+        return self._complete_note_chunks(results)
+
+    def _note_url(self, note_id: str) -> str:
+        """查笔记 url,db 不可用时留空(不影响检索)。"""
+        if self.db is None:
+            return ""
+        try:  # 跨线程/连接失效时 url 留空,不影响检索
+            note = self.db.get_note(note_id)
+            return note.get("url", "") if note else ""
+        except Exception:
+            return ""
+
+    def _complete_note_chunks(self, results: list[dict]) -> list[dict]:
+        """同笔记补全: topN 结果所属笔记的其他 chunk 追加到尾部。
+
+        用全表快照过滤(表只有几百行,毫秒级),避免 lancedb 复杂查询语法。
+        补全 chunk 的 score 记 0.0,靠 seq 排序保持笔记内原始顺序。
+        """
+        if not results:
+            return results
+        try:
+            import pyarrow as pa
+            df = self._get_table().to_arrow().to_pandas()
+        except Exception as e:
+            logger.warning(f"同笔记补全失败(跳过): {e}")
+            return results
+
+        seen = {(r["note_id"], r.get("seq")) for r in results}
+        extra: list[dict] = []
+        for r in results:  # 保持 rerank 顺序,逐个笔记补全
+            note_df = df[df["note_id"] == r["note_id"]]
+            for _, row in note_df.sort_values("seq").iterrows():
+                key = (row["note_id"], int(row.get("seq") or 0))
+                if key in seen:
+                    continue
+                seen.add(key)
+                extra.append({
+                    "note_id": row["note_id"],
+                    "title": row.get("title") or r["title"],
+                    "section": row.get("section") or "",
+                    "text": row.get("text") or "",
+                    "score": 0.0,
+                    "url": r["url"],
+                })
+        return results + extra
 
     def _rerank(self, query: str, candidates: list[str]) -> list[float | None]:
         try:
