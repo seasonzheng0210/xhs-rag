@@ -260,7 +260,7 @@ rerank:
     model: BAAI/bge-reranker-v2-m3      # 免费
     fallback_provider: bailian
     fallback_model: qwen3-rerank        # ¥0.62/M
-  top_k_in: 50
+  top_k_in: 8
   top_k_out: 5
   # ★ 实测（2026-08-30）：分数是 sigmoid 归一化到 [0,1]，且强烈两极化 ——
   #   强相关 0.9997 / 不相关 0.000016，中间值极少。
@@ -268,6 +268,9 @@ rerank:
   #     直觉上设 score > 0.5 会大量误杀真实相关结果。
   #   → 若将来要「低于某分就不返回」，阈值必须实测标定，建议 ≤ 0.05。
   min_score: null                       # null = 不设阈值，只按 top_k_out 截断
+  # 检索结果缓存(秒): 相同 query 短时间重复搜索直接秒回, 省 rerank CPU 推理
+  cache_ttl: 300
+  cache_max: 20
   # 注意：API 响应里 document 字段默认返回 null，需靠 index 回查本地文档
 
 # ────────────────────────────────────────────────────────────
@@ -288,7 +291,8 @@ llm:
   # 想看推理过程再开：true，推理内容走 reasoning_content 字段
   thinking: false
   thinking_effort: low                 # low | high | max（仅 thinking=true 生效）
-  max_context_chars: 600               # 每条片段喂给 LLM 的最大字符（控成本）
+  max_context_chars: 800               # 每条片段喂给 LLM 的最大字符
+  # ⚠️ 必须 ≥ chunk.whole_threshold(800), 否则长 chunk 尾部(常含用量)被截断丢失
   timeout: 60
   # 本地兜底（2 核上很慢，仅应急，不需要 key）
   ollama:

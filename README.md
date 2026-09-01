@@ -119,6 +119,21 @@ Web UI 检索后会用 LLM 基于命中的片段生成回答，流式输出，�
 - 开关：`config.yaml` 的 `serve.debug`（个人局域网默认 `true`；若端口映射到公网，**务必改 `false`**，生产模式只返回错误消息、不暴露堆栈）。
 - 端到端验证：`PYTHONPATH=src python scripts/_debug_mode_test.py`（假 retriever 构造 500，验证两种模式的响应差异）。
 
+## 部署（Docker，手机随时访问）
+
+镜像只跑**查询 + 问答**服务（不含同步采集）；同步留在宿主机跑（采集需要登录态/反检测脚本，容器 IP 易触发小红书风控，职责分离设计）。
+
+```bash
+# 一键启动（本机或云服务器）
+docker compose up -d --build
+# 浏览器打开 http://<服务器IP>:8765
+```
+
+- **数据全挂载**：`./data`（sqlite + lancedb 索引 + 模型 bge-m3/reranker + vault）。升级镜像不丢数据；换机部署把 `data/` 整个拷过去即可。
+- **首次启动会预热模型**（embedder + reranker，约 1-5 分钟），之后查询秒级响应。
+- 部署到公网前务必做三件事：① `serve.debug` 改 `false`；② 加访问密码（未内置，用 Nginx/Caddy basic auth）；③ 同步改手动触发。
+- 服务器内存建议 ≥4GB（embedder ~2GB + reranker ~2GB）。
+
 ## 目录
 
 ```

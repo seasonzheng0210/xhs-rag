@@ -534,8 +534,7 @@ def serve(cfg: Config) -> int:
     logger.info("预热模型(embedding + rerank,首次约 5 分钟)...")
     retriever = Retriever(cfg, db)
     t0 = time.time()
-    retriever.embedder.encode(["预热"])
-    retriever._ensure_reranker()
+    retriever.warmup()
     logger.info(f"模型预热完成,耗时 {time.time()-t0:.0f}s")
 
     Handler.retriever = retriever

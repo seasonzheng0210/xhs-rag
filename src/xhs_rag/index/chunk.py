@@ -16,6 +16,39 @@ from ..core.config import Config
 SECTION_RE = re.compile(r"^##\s+(.+)$", re.M)
 # 跳过代码块/图片引用等非正文内容
 NOISE_RE = re.compile(r"!\[.*?\]\(.*?\)|<!--.*?-->", re.S)
+# 视频帧 OCR 的定位标记,如 <|LOC_0|><|LOC_274|>,纯噪声
+LOC_TAG_RE = re.compile(r"<\|LOC_\d+(?:\|LOC_\d+)*\|>")
+# 纯 emoji/装饰符号行(无字母数字中文),如 🌻🌻🌻
+# 注意: 不能是 raw string(否则 \u2600 变字面量); \uXXXX 只认 4 位,
+# emoji 区(U+1F000+)必须用 8 位 \U0001F000 写法
+EMOJI_LINE_RE = re.compile("^[\\s\\u2600-\\u27BF\\u2B00-\\u2BFF\\U0001F000-\\U0001FAFF\\uFE0F]+$")
+# 无意义 ASCII 乱码行: 含字母、无中文、无数字、长度>=8(如 dgegbspb / aceae)
+# 数字数据行(3.18±0.43)不含字母,不会被命中,安全保留
+GARBAGE_ASCII_LINE_RE = re.compile(r"^[A-Za-z\s\-.()/+&%#@!?=\[\]{}|'\"`~^:;,<>]+$")
+
+
+def clean_ocr_noise(text: str) -> str:
+    """清洗 OCR 噪声(保守策略,只删无争议噪声,不误删正文)。
+
+    1. 删除 <|LOC_n|> 帧定位标记(视频 OCR 的定位符,纯噪声)
+    2. 删除纯 emoji/装饰符号行(🌻🌻🌻 之类)
+    3. 删除无意义 ASCII 乱码行(纯字母无数字无中文,如 aceae)
+    保留: 数字数据行(3.18±0.43)、中英混合行(可能含有效信息)
+    """
+    text = LOC_TAG_RE.sub("", text)
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            out.append("")
+        elif EMOJI_LINE_RE.match(s):
+            continue  # 纯 emoji/符号装饰行
+        elif (len(s) >= 8 and GARBAGE_ASCII_LINE_RE.match(s)
+              and not any(c.isdigit() for c in s)):
+            continue  # 纯字母乱码串(无数字无中文),如 aceae
+        else:
+            out.append(line)
+    return "\n".join(out)
 
 
 class Chunker:
@@ -38,6 +71,8 @@ class Chunker:
 
         # 去掉图片引用和 HTML 注释(OCR 文本不在这里,那是图片替代文本)
         clean = NOISE_RE.sub("", content)
+        # OCR 噪声清洗(LOC 标记/emoji 装饰行/纯字母乱码行),见 clean_ocr_noise
+        clean = clean_ocr_noise(clean)
         # 去掉 # 标题行(标题单独存字段)和 > 引用块(作者/链接等元信息)
         lines = []
         for line in clean.splitlines():

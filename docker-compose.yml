@@ -1,0 +1,22 @@
+# xhs-rag 一键部署: docker compose up -d --build
+#
+# 前提:
+#   1. 本目录下有 .env(LLM/rerank 等 API key)
+#   2. data/ 目录含 lancedb 索引 + data/models 模型
+#      (首次部署可把本机 data/ 整个拷到服务器同目录)
+services:
+  xhs-rag:
+    build: .
+    container_name: xhs-rag
+    ports:
+      - "8765:8765"
+    volumes:
+      # 数据 + 模型 + 索引: 全部走挂载, 升级镜像不丢数据
+      - ./data:/app/data
+      # API key 只读挂载, 不进镜像层
+      - ./.env:/app/.env:ro
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    # 模型预热占内存: embedder(~2GB) + reranker(~2GB), 4GB 内存可跑, 8GB 更稳
+    mem_limit: 8g

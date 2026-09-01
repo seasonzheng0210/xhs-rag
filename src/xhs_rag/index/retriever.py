@@ -6,6 +6,8 @@ rerank 模型本地化(bge-reranker-v2-m3,约 2.3GB,首次下载后常驻内存)
 """
 from __future__ import annotations
 
+import time
+
 from loguru import logger
 
 from ..core.config import Config
@@ -23,6 +25,18 @@ class Retriever:
         self.top_k_out = int(cfg.get("rerank.top_k_out", 5))
         self._reranker = None
         self._table = None
+        # 检索结果缓存: query → (时间戳, results)。rerank CPU 推理是主要耗时,
+        # 相同/相近 query 短时间重复搜索直接秒回
+        self._search_cache: dict[str, tuple[float, list[dict]]] = {}
+        self._cache_ttl = float(cfg.get("rerank.cache_ttl", 300))
+        self._cache_max = int(cfg.get("rerank.cache_max", 20))
+
+    def warmup(self) -> None:
+        """预热: 加载 embedder + reranker,把模型加载时间从首次查询挪到启动阶段。"""
+        t0 = time.time()
+        self.embedder.encode(["预热"])
+        self._ensure_reranker()
+        logger.info(f"检索预热完成(embedder+reranker),耗时 {time.time()-t0:.0f}s")
 
     def _get_table(self):
         import lancedb
@@ -69,7 +83,16 @@ class Retriever:
         chunk 进 topN,就把它在库里的其他 chunk 一并补进结果尾部。
         """
         top_k_out = k or self.top_k_out
-        top_k_in = max(top_k_out * 4, self.top_k_in)
+        # rerank 候选数: 配置优先, 至少比输出多 2 条供淘汰
+        # (旧逻辑 max(top_k_out*4, ...) 在 k=5 时强制 20 候选, rerank CPU 每对 ~1.2s,
+        #  直接把检索拖到 30s —— 候选数必须由配置控制)
+        top_k_in = max(self.top_k_in, top_k_out + 2)
+
+        # 0) 检索缓存命中直接返回(浅拷贝,防调用方修改污染缓存)
+        cache_key = f"{top_k_out}:{query}"
+        cached = self._search_cache.get(cache_key)
+        if cached and time.time() - cached[0] < self._cache_ttl:
+            return [dict(r) for r in cached[1]]
 
         # 1) 编码 query
         qvec = self.embedder.encode([query])[0]
@@ -79,8 +102,8 @@ class Retriever:
         if not hits:
             return []
 
-        # 3) rerank 重排(候选截断 200 字符,CPU 推理 O(n^2) 长文本太慢)
-        candidates = [h["text"][:200] for h in hits]
+        # 3) rerank 重排(候选截断 160 字符,CPU 推理与长度近似线性,越短越快)
+        candidates = [h["text"][:160] for h in hits]
         scores = self._rerank(query, candidates)
         ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
         ranked = [x for x in ranked if x[1] is not None][:top_k_out]
@@ -98,7 +121,16 @@ class Retriever:
                 "score": round(float(score), 4),
                 "url": self._note_url(hit["note_id"]),
             })
-        return self._complete_note_chunks(hits, results)
+        results = self._complete_note_chunks(hits, results)
+
+        # 缓存(超上限时清空最旧一半,简化策略)
+        if len(self._search_cache) >= self._cache_max:
+            stale = sorted(self._search_cache.items(),
+                           key=lambda x: x[1][0])[: self._cache_max // 2]
+            for kk, _ in stale:
+                self._search_cache.pop(kk, None)
+        self._search_cache[cache_key] = (time.time(), results)
+        return results
 
     def _note_url(self, note_id: str) -> str:
         """查笔记 url,db 不可用时留空(不影响检索)。"""
