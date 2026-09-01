@@ -94,12 +94,23 @@ Windows 下也可双击 [`scripts/run.bat`](scripts/run.bat)。
 
 Web UI 检索后会用 LLM 基于命中的片段生成回答，流式输出，每个事实性陈述带 `[n]` 引用角标，**点击角标可跳到对应笔记卡片**。
 
-- 模型：`deepseek-v4-flash`（`$0.14 / 1M` 输入、`$0.28 / 1M` 输出，1M 上下文）。
+- 默认方案（零成本）：**智谱 GLM-4-Flash**（永久免费、不限 Token、128K 上下文）。
+  注册 [open.bigmodel.cn](https://open.bigmodel.cn) 实名后，把 key 填到 `.env` 的 `ZHIPU_API_KEY=`。
+  配置在 `config.yaml` 的 `llm` 段，改 `provider: deepseek` + `DEEPSEEK_API_KEY` 可切回付费 DeepSeek。
+- DeepSeek 备选：`deepseek-v4-flash`（`$0.14 / 1M` 输入、`$0.28 / 1M` 输出，1M 上下文）。
   ⚠️ `deepseek-chat` / `deepseek-reasoner` 已于 **2026-07-24 废弃**，别再写这两个名字。
-- **thinking 默认关闭**：DeepSeek V4 系列默认开启 thinking 且 effort=high，推理 token 同样计费、延迟翻倍。
+- **thinking 默认关闭**：V4 系列默认开启 thinking 且 effort=high，推理 token 同样计费、延迟翻倍。
   RAG 问答用不上推理链，代码里显式发了 `{"thinking": {"type": "disabled"}}`。
-- 未配 `DEEPSEEK_API_KEY` 或接口异常时**优雅降级**：照常展示检索结果，只多一条提示，不报错。
-- 想零成本可把 `llm.provider` 改成 `ollama` 走本地模型（2 核机器上会很慢）。
+- 未配 key 或接口异常时**优雅降级**：照常展示检索结果，只多一条提示，不报错。
+- 想完全本地可把 `llm.provider` 改成 `ollama` 走本地模型（2 核机器上会很慢）。
+
+## 调试模式（所有 Web 项目标配）
+
+报错时页面显示错误卡片，三个操作：**查看错误详情**（完整 traceback，可展开/收起）、**复制错误报告**、**去 WorkBuddy 修复**。
+
+- 报错**自动落盘**到 `data/debug/last_error.txt`（含时间/接口/问题/堆栈），在 WorkBuddy 说「修复上次的错误」即可直接读取修复，无需复制粘贴。
+- 开关：`config.yaml` 的 `serve.debug`（个人局域网默认 `true`；若端口映射到公网，**务必改 `false`**，生产模式只返回错误消息、不暴露堆栈）。
+- 端到端验证：`PYTHONPATH=src python scripts/_debug_mode_test.py`（假 retriever 构造 500，验证两种模式的响应差异）。
 
 ## 目录
 
