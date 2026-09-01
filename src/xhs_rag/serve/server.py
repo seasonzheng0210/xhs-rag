@@ -58,6 +58,24 @@ header .sub{font-size:12px;color:var(--muted)}
 .badge.kind{background:#f0f0ee;color:var(--muted)}
 .card .text{font-size:13px;line-height:1.6;color:#3a3f45;
   display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+.card.hl{border-color:var(--accent);box-shadow:0 0 0 3px #ffe4e8}
+/* ── M8 AI 回答 ── */
+.answer{background:linear-gradient(180deg,#fff9fa,#fff);border:1px solid #ffd7dd;
+  border-radius:var(--radius);padding:14px 16px;margin-bottom:14px}
+.answer .hd{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:700;
+  color:var(--accent);margin-bottom:8px}
+.answer .hd .tag{font-size:11px;font-weight:500;color:var(--muted);
+  background:#fff;border:1px solid var(--border);border-radius:99px;padding:1px 8px}
+.answer .body{font-size:14px;line-height:1.75;color:#2b2f35;white-space:pre-wrap;
+  word-break:break-word}
+.answer .body:empty::after{content:'思考中…';color:var(--muted);font-size:13px}
+sup.cite{display:inline-block;min-width:15px;padding:0 3px;margin:0 1px;
+  font-size:11px;line-height:1.5;text-align:center;color:var(--accent);
+  background:#fff1f2;border-radius:4px;cursor:pointer;vertical-align:super;
+  text-decoration:none}
+sup.cite:hover{background:var(--accent);color:#fff}
+.notice{font-size:12px;color:#8a6d3b;background:#fff8e6;border:1px solid #ffe6a8;
+  border-radius:10px;padding:8px 12px;margin-bottom:12px}
 .footer{margin-top:18px;font-size:12px;color:var(--muted);text-align:center}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid #ffd7dd;
   border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;
@@ -73,6 +91,7 @@ header .sub{font-size:12px;color:var(--muted)}
 </div>
 <div class="hint">试试：怎么护理宝宝私处 / 衣物清洗 / 月子喂养</div>
 <div id="status"></div>
+<div id="answer-box"></div>
 <div id="results"></div>
 <div class="footer" id="foot"></div>
 <script>
@@ -82,34 +101,78 @@ async function go(){
   const q=$('#q').value.trim();
   if(!q||loading)return;
   loading=true;$('#btn').disabled=true;
-  $('#status').innerHTML='<span class="spin"></span>搜索中…';
-  $('#results').innerHTML='';
+  $('#status').innerHTML='<span class="spin"></span>检索中…';
+  $('#results').innerHTML='';$('#answer-box').innerHTML='';
   const t0=Date.now();
   try{
-    const r=await fetch('/api/search?q='+encodeURIComponent(q));
-    const d=await r.json();
-    if(d.error){$('#status').textContent='出错了：'+d.error;return}
-    const secs=((Date.now()-t0)/1000).toFixed(1);
-    $('#status').textContent='找到 '+d.results.length+' 条，耗时 '+secs+' 秒';
-    render(d.results);
+    // 一次性流式接口：先推检索结果，再逐字推 LLM 回答
+    const resp=await fetch('/api/answer?q='+encodeURIComponent(q));
+    const reader=resp.body.getReader(),dec=new TextDecoder();
+    let buf='';
+    for(;;){
+      const {done,value}=await reader.read();
+      if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      const lines=buf.split('\\n');buf=lines.pop();
+      for(const ln of lines){
+        if(!ln.startsWith('data: '))continue;
+        let d;try{d=JSON.parse(ln.slice(6))}catch(e){continue}
+        if(d.type==='meta'){
+          $('#status').textContent='检索到 '+d.results.length+' 条，正在生成回答…';
+          render(d.results);
+        }else if(d.type==='delta'){
+          let b=$('#answer-box .body');
+          if(!b){$('#answer-box').innerHTML=
+            '<div class="answer"><div class="hd">🤖 AI 回答<span class="tag" id="amodel"></span></div><div class="body"></div></div>';
+            b=$('#answer-box .body');
+            if(d.model)$('#amodel').textContent=d.model;
+          }
+          b.appendChild(document.createTextNode(d.text));
+        }else if(d.type==='notice'){
+          const n=document.createElement('div');n.className='notice';
+          n.textContent=d.message;
+          $('#answer-box').appendChild(n);
+        }else if(d.type==='done'){
+          // 生成完毕，把正文里的 [n] 统一渲染成可点击角标
+          const b=$('#answer-box .body');
+          if(b)b.innerHTML=withCites(b.textContent);
+          const secs=((Date.now()-t0)/1000).toFixed(1);
+          $('#status').textContent='共耗时 '+secs+' 秒（检索 '+d.search_secs
+            +' 秒 + 生成 '+d.llm_secs+' 秒）';
+        }
+      }
+    }
+    if(!$('#answer-box .body'))$('#status').textContent='没有相关内容，换个关键词试试';
   }catch(e){$('#status').textContent='请求失败：'+e}
   finally{loading=false;$('#btn').disabled=false}
 }
 function render(items){
   const box=$('#results');box.innerHTML='';
   if(!items.length){box.innerHTML='<div class="card">没有相关内容，换个关键词试试</div>';return}
-  for(const it of items){
-    const d=document.createElement('div');d.className='card';
+  items.forEach((it,i)=>{
+    const d=document.createElement('div');d.className='card';d.id='r'+(i+1);
     const kind=it.note_type==='video'?'视频':'图文';
     d.innerHTML=
       '<a class="title" href="'+it.url+'" target="_blank">'+esc(it.title)+'</a>'+
-      '<div class="meta"><span class="badge score">'+it.score+'</span>'+
+      '<div class="meta"><span class="badge score">['+(i+1)+'] '+it.score+'</span>'+
       '<span class="badge kind">'+kind+'</span>'+
       (it.section?'<span class="badge kind">'+esc(it.section)+'</span>':'')+'</div>'+
       '<div class="text">'+esc(it.text)+'</div>';
     box.appendChild(d);
-  }
+  });
 }
+// 引用角标 [n] → 可点击上标，点击滚动到对应卡片
+function withCites(txt){
+  return esc(txt).replace(/\\[(\\d+)\\]/g,(m,n)=>'<sup class="cite" data-n="'+n+'">'+n+'</sup>');
+}
+document.addEventListener('click',e=>{
+  const s=e.target.closest('sup.cite');if(!s)return;
+  const card=document.getElementById('r'+s.dataset.n);
+  if(!card)return;
+  document.querySelectorAll('.card.hl').forEach(c=>c.classList.remove('hl'));
+  card.classList.add('hl');
+  card.scrollIntoView({behavior:'smooth',block:'center'});
+});
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 $('#q').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
 (async()=>{try{const r=await fetch('/api/stats');const d=await r.json();
@@ -135,9 +198,12 @@ def lan_ip() -> str:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # SSE 需要长连接 + chunked，HTTP/1.0 会每次关连接
+    protocol_version = "HTTP/1.1"
     retriever: Retriever = None
     db: DB = None
     db_path: str = ""
+    answerer = None  # qa.Answerer，未配置则 None
 
     def _db_conn(self):
         """每请求新建 sqlite 连接(sqlite 连接不能跨线程)。"""
@@ -149,6 +215,47 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):  # 静默访问日志
         logger.debug(fmt % args)
+
+    # ── SSE ────────────────────────────────────────────────
+    def _sse_head(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")  # 关掉 nginx 缓冲
+        # ★ 标准库不会自动分块：不声明 chunked 的话客户端会一直等 body
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+    def _sse(self, obj: dict):
+        """推一条 SSE 事件（手动 chunked 编码）。
+        客户端中途断开会抛 ConnectionResetError / BrokenPipeError，由调用方吞掉。"""
+        data = ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
+        self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+        self.wfile.flush()
+
+    def _sse_end(self):
+        """写终止 chunk，告诉客户端流结束。"""
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except Exception:
+            pass
+
+    def _enrich(self, results: list[dict]):
+        """补 url / note_type（独立 sqlite 连接，避免跨线程）。"""
+        if not results:
+            return results
+        conn = self._db_conn()
+        try:
+            for r in results:
+                note = conn.execute(
+                    "SELECT url, note_type FROM notes WHERE note_id=?",
+                    (r["note_id"],)).fetchone()
+                r["url"] = note["url"] if note else ""
+                r["note_type"] = note["note_type"] if note else "note"
+        finally:
+            conn.close()
+        return results
 
     def _json(self, data: dict, code: int = 200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -176,28 +283,76 @@ class Handler(BaseHTTPRequestHandler):
                 return
             t0 = time.time()
             try:
-                results = self.retriever.search(q)
-                secs = round(time.time() - t0, 1)
-                # 独立连接补全 url / 类型(避免 sqlite 跨线程)
-                conn = self._db_conn()
-                try:
-                    for r in results:
-                        note = conn.execute(
-                            "SELECT url, note_type FROM notes WHERE note_id=?",
-                            (r["note_id"],)).fetchone()
-                        r["url"] = note["url"] if note else ""
-                        r["note_type"] = note["note_type"] if note else "note"
-                finally:
-                    conn.close()
-                self._json({"q": q, "secs": secs, "results": results})
+                results = self._enrich(self.retriever.search(q))
+                self._json({"q": q, "secs": round(time.time() - t0, 1),
+                            "results": results})
             except Exception as e:
                 logger.exception("搜索失败")
                 self._json({"error": str(e)}, 500)
+        elif url.path == "/api/answer":
+            self._handle_answer(url)
         elif url.path == "/api/stats":
             self._json(self._stats())
         else:
+            # HTTP/1.1 下必须给 Content-Length，否则客户端会一直等 body
             self.send_response(404)
+            self.send_header("Content-Length", "0")
             self.end_headers()
+
+    def _handle_answer(self, url):
+        """检索 + LLM 问答，SSE 流式：
+        先推 meta(检索结果) → 逐字推 delta(回答) → done(耗时)。
+        LLM 不可用时只推 notice，检索结果照常返回。"""
+        q = (parse_qs(url.query).get("q") or [""])[0].strip()
+        if not q:
+            self._json({"error": "缺少 q 参数"}, 400)
+            return
+        self._sse_head()
+        try:
+            t0 = time.time()
+            results = self._enrich(self.retriever.search(q))
+            search_secs = round(time.time() - t0, 1)
+            self._sse({"type": "meta", "q": q, "secs": search_secs,
+                       "results": results})
+            if not results:
+                self._sse({"type": "done", "search_secs": search_secs,
+                           "llm_secs": 0})
+                return
+
+            answerer = self.answerer
+            if answerer is None:
+                self._sse({"type": "notice",
+                           "message": "未启用 LLM 问答（llm.enabled 为 false）"})
+                self._sse({"type": "done", "search_secs": search_secs,
+                           "llm_secs": 0})
+                return
+            ok, why = answerer.available()
+            if not ok:
+                self._sse({"type": "notice",
+                           "message": f"跳过 AI 回答：{why}"})
+                self._sse({"type": "done", "search_secs": search_secs,
+                           "llm_secs": 0})
+                return
+
+            t1 = time.time()
+            first = True
+            for piece in answerer.stream(q, results):
+                evt = {"type": "delta", "text": piece}
+                if first:  # 首块带上模型名，用于 UI 角标
+                    evt["model"] = answerer.model
+                    first = False
+                self._sse(evt)
+            self._sse({"type": "done", "search_secs": search_secs,
+                       "llm_secs": round(time.time() - t1, 1)})
+        except Exception as e:  # 含 LLMUnavailable 与客户端断开
+            logger.warning(f"问答失败: {e}")
+            try:
+                self._sse({"type": "notice", "message": f"AI 回答失败：{e}"})
+                self._sse({"type": "done", "search_secs": 0, "llm_secs": 0})
+            except Exception:
+                pass  # 客户端已断开，忽略
+        finally:
+            self._sse_end()  # 所有出口都补终止 chunk
 
     def _note_type(self, nid: str) -> str:
         if not self.db_path:
@@ -236,6 +391,24 @@ class Handler(BaseHTTPRequestHandler):
                 "asr_chars": asr_chars, "chunks": chunks}
 
 
+def _build_answerer(cfg: Config):
+    """构造 LLM 问答器。任何异常都不该拖垮 Web 服务 —— 降级为纯检索。"""
+    try:
+        from ..qa.answer import Answerer
+
+        ans = Answerer(cfg)
+        ok, why = ans.available()
+        if ok:
+            logger.info(f"LLM 问答已启用: {ans.provider} / {ans.model}"
+                        f"（thinking={'on' if ans.thinking else 'off'}）")
+        else:
+            logger.warning(f"LLM 问答不可用，只提供检索结果：{why}")
+        return ans
+    except Exception as e:
+        logger.warning(f"LLM 模块加载失败，只提供检索结果：{e}")
+        return None
+
+
 def serve(cfg: Config) -> int:
     """启动 Web 服务(模型预热 + 0.0.0.0 监听)。"""
     from ..store.db import DB
@@ -252,6 +425,7 @@ def serve(cfg: Config) -> int:
     Handler.retriever = retriever
     Handler.db = db
     Handler.db_path = str(cfg.path("paths.db"))
+    Handler.answerer = _build_answerer(cfg)
 
     host = cfg.get("serve.host", "0.0.0.0")
     port = int(cfg.get("serve.port", 8765))

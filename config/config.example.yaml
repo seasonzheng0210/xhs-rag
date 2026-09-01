@@ -274,17 +274,23 @@ rerank:
 # 问答
 # ────────────────────────────────────────────────────────────
 llm:
-  provider: deepseek                   # deepseek | glm | siliconflow | ollama
+  enabled: true                        # 关掉则只出检索结果，不调 LLM
+  provider: deepseek                   # deepseek | ollama
   base_url: https://api.deepseek.com/v1
   api_key_env: DEEPSEEK_API_KEY
-  model: deepseek-chat                 # ¥0.001/千 token 入，个人用量月均几毛
+  # ★ deepseek-chat / deepseek-reasoner 已于 2026-07-24 废弃，
+  #   统一用 deepseek-v4-flash（价格不变：$0.14/1M 入、$0.28/1M 出）
+  #   —— 别改成 deepseek-v4-pro，贵 3.1 倍，RAG 问答用不上
+  model: deepseek-v4-flash
   temperature: 0.2
   max_tokens: 2000
-  # 零成本备选：智谱 GLM-4-Flash 完全免费（128K 上下文）
-  # provider: glm / base_url: https://open.bigmodel.cn/api/paas/v4
-  # model: glm-4-flash
-  # 硅基流动上 THUDM/GLM-4-9B-0414、GLM-Z1-9B-0414 也是免费档
-  # 本地兜底（2 核上很慢，仅应急）
+  # thinking 默认开启且 effort=high（推理链也计费、延迟翻倍），RAG 问答必须显式关闭
+  # 想看推理过程再开：true，推理内容走 reasoning_content 字段
+  thinking: false
+  thinking_effort: low                 # low | high | max（仅 thinking=true 生效）
+  max_context_chars: 600               # 每条片段喂给 LLM 的最大字符（控成本）
+  timeout: 60
+  # 本地兜底（2 核上很慢，仅应急，不需要 key）
   ollama:
     base_url: http://127.0.0.1:11434/v1
     model: qwen3:8b

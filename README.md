@@ -17,6 +17,7 @@ Markdown 落盘，Obsidian 可直接打开；数据全部留在本机。
 | **M5** | 索引与检索（bge-m3 embedding + bge-reranker 重排，LanceDB） | ✅ |
 | **M6** | Web UI（移动端优先，局域网手机可访问） | ✅ |
 | **M7** | 定时增量同步（每日自动 collect → 详情 → OCR → ASR → 索引） | ✅ |
+| **M8** | LLM 问答（检索结果 → 带 `[n]` 引用的流式回答，点角标跳原帖） | ✅ |
 
 ## 数据流
 
@@ -37,6 +38,9 @@ Markdown 落盘，Obsidian 可直接打开；数据全部留在本机。
                                         │
                                         ▼
                     Web UI: query → 向量检索 → rerank 重排 → 结果卡片
+                                        │
+                                        ▼
+                            LLM 问答(SSE 流式, 带 [n] 引用可点跳转)
 ```
 
 ## 环境要求
@@ -44,6 +48,7 @@ Markdown 落盘，Obsidian 可直接打开；数据全部留在本机。
 - Python ≥ 3.11（本机 3.13）
 - ffmpeg（视频抽帧 / ASR 用，可执行文件或 PATH 均可）
 - 可选：硅基流动 API key（M3/M4 的 OCR/ASR 升级降级用，本地 RapidOCR 兜底）
+- 可选：DeepSeek API key（M8 LLM 问答用，不填则只出检索结果，不影响其他功能）
 
 检索链路（embedding + rerank）为**纯本地模型**（bge-m3 + bge-reranker-base），无外部 API 依赖，数据不出本机。
 
@@ -66,6 +71,9 @@ python -m xhs_rag.cli sync
 
 # 4. 启动 Web UI（默认 0.0.0.0:8765，手机同局域网可访问）
 python -m xhs_rag.cli serve
+
+# 5. 命令行问答（不想开浏览器时，检索 + LLM 带引用回答）
+python -m xhs_rag.cli ask "月子里怎么吃"
 ```
 
 Windows 下也可双击 [`scripts/run.bat`](scripts/run.bat)。
@@ -80,6 +88,18 @@ Windows 下也可双击 [`scripts/run.bat`](scripts/run.bat)。
 | `python -m xhs_rag.cli collect` | 同步收藏列表到 SQLite + JSONL |
 | `python -m xhs_rag.cli sync` | 全流水线：collect → detail → OCR → ASR → 增量索引 |
 | `python -m xhs_rag.cli serve` | 启动 Web UI（检索 + 问答） |
+| `python -m xhs_rag.cli ask "问题"` | 命令行问答：检索 + LLM 带引用回答（`-k` 控制片段数） |
+
+## LLM 问答（M8）
+
+Web UI 检索后会用 LLM 基于命中的片段生成回答，流式输出，每个事实性陈述带 `[n]` 引用角标，**点击角标可跳到对应笔记卡片**。
+
+- 模型：`deepseek-v4-flash`（`$0.14 / 1M` 输入、`$0.28 / 1M` 输出，1M 上下文）。
+  ⚠️ `deepseek-chat` / `deepseek-reasoner` 已于 **2026-07-24 废弃**，别再写这两个名字。
+- **thinking 默认关闭**：DeepSeek V4 系列默认开启 thinking 且 effort=high，推理 token 同样计费、延迟翻倍。
+  RAG 问答用不上推理链，代码里显式发了 `{"thinking": {"type": "disabled"}}`。
+- 未配 `DEEPSEEK_API_KEY` 或接口异常时**优雅降级**：照常展示检索结果，只多一条提示，不报错。
+- 想零成本可把 `llm.provider` 改成 `ollama` 走本地模型（2 核机器上会很慢）。
 
 ## 目录
 

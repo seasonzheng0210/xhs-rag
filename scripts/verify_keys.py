@@ -10,8 +10,10 @@ API 密钥连通性自检 —— 零依赖，标准库即可运行。
     2. 硅基流动：是否完成实名认证（★ 最关键，未实名则全部功能停用）
     3. 各供应商 embedding / rerank 免费模型是否真的可调用
     4. 免费 OCR / ASR 模型 id 是否在线
+    5. DeepSeek：LLM 问答（M8）能否调通，thinking 是否已关闭
 
 退出码：0 = 主力供应商可用；1 = 有阻塞项
+LLM 问答失败不算阻塞（检索照常可用），只告警
 """
 import json
 import os
@@ -155,6 +157,72 @@ def test_rerank(base: str, key: str, model: str):
                   f"（sigmoid 归一化，勿设绝对阈值）")
 
 
+# M8 LLM 问答：只做 chat/completions 连通性验证，不测 embedding/rerank
+LLM_PROVIDERS = {
+    "deepseek": {
+        "env": "DEEPSEEK_API_KEY",
+        "name": "DeepSeek（M8 LLM 问答 / 付费可选）",
+        "base": "https://api.deepseek.com/v1",
+        "model": "deepseek-v4-flash",
+        "prefix": "sk-",
+        # ★ 2026-07-24 起 deepseek-chat / deepseek-reasoner 已废弃，调用会直接报错
+        "deprecated": ["deepseek-chat", "deepseek-reasoner"],
+        "thinking_control": True,
+    },
+    "zhipu": {
+        "env": "ZHIPU_API_KEY",
+        "name": "智谱 GLM-4-Flash（M8 LLM 问答 / 永久免费主力）",
+        "base": "https://open.bigmodel.cn/api/paas/v4",
+        "model": "glm-4-flash",
+        "prefix": "",
+        "deprecated": [],
+        "thinking_control": False,
+    },
+}
+
+
+def test_llm(base: str, key: str, model: str, provider: str):
+    """发一个极短请求，验证 key 有效 + 模型名可用 + thinking 已关闭。"""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "回复两个字：收到"}],
+        "stream": False,
+        "max_tokens": 16,
+    }
+    if provider == "deepseek":
+        # ★ V4 系列默认开启 thinking（推理 token 也计费），必须显式关闭
+        payload["thinking"] = {"type": "disabled"}
+        payload["temperature"] = 0
+
+    ok, status, data, ms = http_json(
+        f"{base}/chat/completions", key, payload, timeout=45)
+    if not ok:
+        txt = str(data)
+        low = txt.lower()
+        if status == 401:
+            return False, "key 无效或已过期，去对应平台重新生成"
+        if status == 402:
+            return False, "余额不足（按 provider 的充值/实名要求处理后重试）"
+        if status == 400 and ("model" in low or "model_name" in low):
+            return False, f"模型名不可用（很可能已废弃或需改 ID）：{txt[:200]}"
+        return False, f"HTTP {status} {txt[:200]}"
+
+    try:
+        msg = data["choices"][0]["message"]
+        content = (msg.get("content") or "").strip()
+        reasoning = msg.get("reasoning_content")
+    except Exception:
+        return False, f"响应结构异常：{str(data)[:200]}"
+
+    usage = data.get("usage", {})
+    note = ""
+    if reasoning:  # 有推理链说明 thinking 没关掉，会多花钱
+        note = "  ⚠ thinking 未关闭（返回了 reasoning_content，推理 token 也计费）"
+    return True, (f"回复「{content[:24]}」，"
+                  f"tokens 入 {usage.get('prompt_tokens', '?')} / "
+                  f"出 {usage.get('completion_tokens', '?')}，{ms}ms{note}")
+
+
 def check_siliconflow_verification(base: str, key: str):
     """
     硅基流动实名状态 —— 未实名则 2026-05-15 起停用全部平台功能。
@@ -253,6 +321,32 @@ def main():
             blocking.append(f"{cfg['name']} 调用失败")
         print()
 
+    # ── M8 LLM 问答 ───────────────────────────────────────
+    llm_states = {}
+    APPLY_URL = {"deepseek": "platform.deepseek.com/api_keys",
+                 "zhipu": "open.bigmodel.cn（免费，注册实名即得 key）"}
+    for pid, lcfg in LLM_PROVIDERS.items():
+        print("-" * 68)
+        print(f"■ {lcfg['name']}")
+        key = filled.get(lcfg["env"], "")
+        print(f"  变量 {lcfg['env']}  ->  {mask(key)}")
+        if not key:
+            print(f"  {SKIP} 未填写 —— 只影响 AI 问答，检索与抓取照常可用")
+            print(f"        申请：{APPLY_URL.get(pid, lcfg['env'])}")
+            llm_states[pid] = "skip"
+            print()
+            continue
+        if lcfg["prefix"] and not key.startswith(lcfg["prefix"]):
+            print(f"  {WARN} 格式可疑：通常应以 '{lcfg['prefix']}' 开头，继续尝试…")
+        ok_llm, msg_llm = test_llm(lcfg["base"], key, lcfg["model"], pid)
+        print(f"  {OK if ok_llm else FAIL} 模型 {lcfg['model']}")
+        print(f"         {msg_llm}")
+        if not ok_llm and lcfg["deprecated"]:
+            print(f"  {WARN} 已停用的旧模型名：{'、'.join(lcfg['deprecated'])}"
+                  f"（2026-07-24 起调用直接报错，改回 {lcfg['model']}）")
+        llm_states[pid] = "ok" if ok_llm else "warn"
+        print()
+
     # ── 汇总 ──────────────────────────────────────────────
     print("=" * 68)
     print(" 汇总")
@@ -265,11 +359,11 @@ def main():
     print()
     if results.get("siliconflow") == "ok":
         print(f"{OK} 主力供应商可用 —— 可以开 M0 了")
-        # 剩余变量提示
-        llm = filled.get("DEEPSEEK_API_KEY", "")
-        if not llm:
-            print(f"{WARN} DEEPSEEK_API_KEY 未填：不影响抓取和检索，"
-                  f"只影响 Web UI 的「对话式问答」功能，M6 前补上即可")
+        # 剩余变量提示：LLM 问答 key（当前主力免费方案是智谱 GLM-4-Flash）
+        llm_filled = any(k for k in ("ZHIPU_API_KEY", "DEEPSEEK_API_KEY") if filled.get(k))
+        if not llm_filled:
+            print(f"{WARN} 未填 LLM 问答 key（ZHIPU_API_KEY 免费 / DEEPSEEK_API_KEY 付费）："
+                  f"不影响抓取和检索，只影响 Web UI 的「AI 回答」功能")
         return 0
 
     print(f"{FAIL} 阻塞项：")

@@ -420,6 +420,43 @@ def cmd_search(cfg: Config, query: str, k: int = 5) -> int:
     return 0
 
 
+def cmd_ask(cfg: Config, query: str, k: int = 5) -> int:
+    """M8：检索 + LLM 生成带引用的回答（终端流式打印，方便调 prompt）。"""
+    from .index.retriever import Retriever
+    from .qa.answer import Answerer, LLMUnavailable, pretty_stream
+    from .store.db import DB
+
+    cfg.ensure_dirs("paths.data_dir", "paths.db")
+    db = DB(cfg.path("paths.db"))
+    r = Retriever(cfg, db)
+    t0 = time.time()
+    results = r.search(query, k=k)
+    search_secs = round(time.time() - t0, 1)
+    if not results:
+        logger.warning("没有检索到相关内容")
+        return 1
+    print(f"\n『{query}』 检索 {len(results)} 条 / {search_secs}s\n")
+    for i, hit in enumerate(results, 1):
+        print(f"  [{i}] {hit['title']}"
+              + (f" — {hit['section']}" if hit["section"] else ""))
+        print(f"      {hit['text'].replace(chr(10), ' ')[:120]}...")
+
+    ans = Answerer(cfg)
+    ok, why = ans.available()
+    if not ok:
+        logger.warning(f"跳过 AI 回答：{why}")
+        return 0
+    print(f"\n────── AI 回答（{ans.model}"
+          f"{'，thinking' if ans.thinking else ''}） ──────\n")
+    try:
+        st = pretty_stream(query, results, ans)
+    except LLMUnavailable as e:
+        logger.error(f"AI 回答失败：{e}")
+        return 1
+    print(f"\n────── 生成 {st['secs']}s ──────")
+    return 0
+
+
 # ── sync ────────────────────────────────────────────────
 def cmd_sync(cfg: Config, headless: bool = False,
              max_pages: int = 50, skip_media: bool = False) -> int:
@@ -493,6 +530,9 @@ def main(argv: list[str] | None = None) -> int:
     p_search = sub.add_parser("search", help="语义检索（M5）")
     p_search.add_argument("query", help="检索关键词/问题")
     p_search.add_argument("-k", type=int, default=5, help="返回条数")
+    p_ask = sub.add_parser("ask", help="检索 + LLM 带引用回答（M8）")
+    p_ask.add_argument("query", help="问题")
+    p_ask.add_argument("-k", type=int, default=5, help="喂给 LLM 的片段数")
     p_sync = sub.add_parser("sync", help="一键全量同步（M7：collect→detail→ocr→video→index）")
     p_sync.add_argument("--headless", action="store_true", help="无头模式（定时任务用，风控更严）")
     p_sync.add_argument("--max-pages", type=int, default=50, help="收藏列表翻页上限")
@@ -524,6 +564,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_index(cfg, force=args.force, limit=args.limit)
     if args.cmd == "search":
         return cmd_search(cfg, args.query, k=args.k)
+    if args.cmd == "ask":
+        return cmd_ask(cfg, args.query, k=args.k)
     if args.cmd == "sync":
         return cmd_sync(cfg, headless=args.headless,
                         max_pages=args.max_pages, skip_media=args.skip_media)
