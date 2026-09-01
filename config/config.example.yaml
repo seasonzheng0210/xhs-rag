@@ -1,0 +1,321 @@
+# 小红书收藏夹 RAG —— 配置模板
+# 复制为 config.yaml 后按需修改。config.yaml 已加入 .gitignore。
+
+# ────────────────────────────────────────────────────────────
+# 路径（相对项目根目录，也可用绝对路径）
+# ────────────────────────────────────────────────────────────
+paths:
+  data_dir: data
+  db: data/xhs.db
+  jsonl_dir: data/jsonl          # 原始响应留档，崩溃可重放
+  images_dir: data/images
+  lancedb_dir: data/lancedb
+  vault_dir: vault               # 输出的 Obsidian vault
+  browser_profile: data/browser_profile   # ★ Playwright 持久化目录，指纹恒定
+  storage_state: data/auth/storage_state.json
+
+# ────────────────────────────────────────────────────────────
+# API 供应商（2026-08-30 核实，价格随时变，以官网为准）
+# ★ 三家都对接，主用硅基流动免费档，挂了自动降级到百炼
+# ────────────────────────────────────────────────────────────
+providers:
+  siliconflow:                        # 主力：四道工序全免费
+    base_url: https://api.siliconflow.cn/v1
+    api_key_env: SILICONFLOW_API_KEY
+    # ★ 硬门槛：2026-05-15 起未实名认证「无法使用任何平台功能」，
+    #   且未实名账户限流降到 10 RPM（本项目等于不可用）。
+    #   实名流程见 docs/API密钥申请指引.md
+    # ⚠️ 官方明确：免费模型限流是固定值，充值也不提升
+    #    embedding RPM 2000-10000 / TPM 500K-10M
+    #    rerank     RPM 2000        / TPM 500K
+    #    多模态(OCR) 官方未公开限流 ← 需实测，是最可能先打满的一环
+    free_models:
+      embedding: BAAI/bge-m3
+      rerank: BAAI/bge-reranker-v2-m3
+      ocr: PaddlePaddle/PaddleOCR-VL-1.5      # 0.9B，OmniDocBench v1.5 94.5%
+      # v1.4 更换：Qwen3-ASR-1.7B 比 SenseVoiceSmall 更新、中文更强，同为免费
+      # SenseVoiceSmall 保留作备选（配置在 video.asr.fallback_model）
+      asr: Qwen/Qwen3-ASR-1.7B
+    # ⚠️ 避坑：Pro/ 前缀是付费版（¥0.07/M）。用错 ID 会以为免费档取消了
+    paid_fallback:
+      embedding: Pro/BAAI/bge-m3              # ¥0.07/M
+      rerank: Pro/BAAI/bge-reranker-v2-m3     # ¥0.07/M
+
+  bailian:                            # 备份：全量约 ¥59，免费档取消时顶上
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
+    models:
+      embedding: text-embedding-v4            # ¥0.617/M
+      rerank: qwen3-rerank                    # ¥0.62/M
+      ocr: qwen3-vl-flash                     # ¥0.18/M 入, ¥1.8/M 出（北京地域）
+      asr: fun-asr                            # ¥0.000264/秒 ≈ ¥0.016/分钟
+    # ⚠️ 不要用 qwen-vl-ocr（¥6.34/M），比 qwen3-vl-flash 贵 35 倍
+    free_quota: "新用户 90 天内各 100 万 token"
+
+  zhipu:                              # 末位备份：全量约 ¥192，性价比最低
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key_env: ZHIPU_API_KEY
+    models:
+      embedding: embedding-3                  # ¥0.5/M（Batch API 五折 ¥0.25/M）
+      rerank: rerank                          # ¥0.8/M
+      ocr: glm-4v-flash                       # 免费（知识库服务内）
+      asr: glm-asr                            # ¥0.06/分钟 ← 最贵的一档
+    # 优点：embedding-3 支持 256/512/1024/2048 维自定义，省存储
+
+# 成本闸门：任何一道工序累计超限就停，防止免费档偷偷变付费
+budget:
+  monthly_limit: 10.0                 # 月累计上限（元），超出拒绝调用并告警
+  warn_at: 5.0                        # 达到此值先告警
+  # 按 500 条 / 30% 视频 实测量级重算（v1.4）
+  #   首次全量：免费档 ¥0 / 全百炼约 ¥19（原按 1400 条估的 ¥59 已作废）
+  #   明细：embedding ¥0.37 + OCR 约 ¥2 + ASR ¥7.2 + rerank 首月约 ¥9
+
+# ────────────────────────────────────────────────────────────
+# 登录
+# ────────────────────────────────────────────────────────────
+auth:
+  user_id: ""                    # 你的小红书 user_id，首次登录后会自动填入
+  headless: false                # 扫码必须可见；日常同步可设 true
+  stealth_script: assets/stealth.min.js
+  qrcode_output: data/auth/qrcode.png
+  qrcode_timeout: 180            # 等待扫码秒数
+  notify_on_expire: true         # 登录失效时通知
+  notify_email: ""               # 留空则只用桌面通知
+
+browser:
+  # CDP 模式：连接本机已有的 Chrome，风控更低，但会占用浏览器
+  # 需要先用 chrome.exe --remote-debugging-port=9222 启动
+  use_cdp: false
+  cdp_endpoint: http://127.0.0.1:9222
+  user_agent: ""                 # 留空则用 Playwright 默认
+  viewport: [1440, 900]
+  locale: zh-CN
+  timezone: Asia/Shanghai
+
+  # ★ 每次启动浏览器时，把 storage_state.json 里的 cookie 重新注入。
+  #   实测（2026-08-31）：小红书会下发删除指令清掉 web_session，
+  #   profile 目录的 Cookies 库随之被掏空。只靠 persistent profile
+  #   等于把登录态的生死交给服务端，必须有本地副本兜底。
+  restore_cookies: true
+
+# ────────────────────────────────────────────────────────────
+# 限速（直接决定会不会触发风控，A8 的关键）
+# 参考：闭源插件 rednote2obsidian 默认 10 分钟一批、每批 5 条
+# ────────────────────────────────────────────────────────────
+ratelimit:
+  list_scroll_interval: [1.2, 1.8]     # 列表页滚动间隔（秒），高斯抖动
+  list_idle_timeout: 8                 # 空闲多久判定到底
+  detail_interval: [1.5, 3.0]          # 详情页间隔
+  media_concurrency: 3                 # 图片下载并发
+  batch_size: 30                       # 每批条数
+  batch_pause: [20, 40]                # 批间休息（秒）
+  on_captcha_cooldown: 600             # 遇到验证码冷却（秒）
+  on_461_cooldown: 1800                # 遇到风控冷却（秒）
+  max_notes_per_run: 500               # ★ v1.4：500 条量级下一轮能跑完，不必分次
+  daily_full_sync: 2                   # 每天全量同步次数上限
+
+# ────────────────────────────────────────────────────────────
+# 同步
+# ────────────────────────────────────────────────────────────
+sync:
+  early_stop_streak: 30                # 连续 N 条未变化则停止翻页
+  fetch_comments: false                # ★ 用户决策：不抓评论
+  keep_original_images: false          # ★ 用户决策：OCR 后删原图，省约 90% 空间
+  keep_thumbnail: true                 # 保留 320px 宽封面缩略图（500 条约 15MB）
+  thumbnail_width: 320
+  keep_image_on_ocr_fail: true         # OCR+VLM 都失败则保留原图，避免信息彻底丢失
+  image_formats: [jpg, webp, avif]
+  retry_max: 3
+  retry_backoff: [2, 4, 8]
+
+# ────────────────────────────────────────────────────────────
+# 视频处理（见 项目计划.md §6.5）
+# ★ 核心原则：视频不落盘，下载到 tmp → I 帧抽帧 + OCR → 立即删除
+# ────────────────────────────────────────────────────────────
+video:
+  enabled: true
+  download_dir: data/tmp/video         # 处理完立即清空
+  frame_dir: data/tmp/frames
+  # ffmpeg 路径。留空则依次尝试 PATH → imageio-ffmpeg 内置版本。
+  # Windows 未安装时可 winget install Gyan.FFmpeg，或下载后填绝对路径。
+  ffmpeg_path: ""
+
+  # 抽帧策略：I 帧抽样，不做场景检测
+  # （场景检测要全帧解码：2 核上 150 条 × 3 分钟 = 450 分钟素材需 4-7 小时，不可接受）
+  frame_mode: ikey                     # ikey | scene | interval
+  frame_scale_width: 640               # 抽帧后先降分辨率，OCR 前处理量也小
+  frame_quality: 4                     # JPEG q 值，2-31，越小越清晰
+
+  # 三重保险
+  min_frames: 3                        # 少于此值 → 退化为每 3 秒固定抽一帧
+  max_frames: 40                       # 多于此值 → 按时间均匀采样
+  dedup_similarity: 0.9                # 相邻帧 OCR 文本相似度 > 此值 → 丢弃后一帧
+
+  # NVDEC 硬解（可选，需驱动 ≥ 580.105.08，见 项目计划.md §0.4）
+  # ★ 这是 GeForce 940M 唯一有真实价值的用途：抽帧瓶颈在解码
+  hwaccel: none                        # none | cuda
+  # 仅在 M5.5 实测提速 ≥ 2 倍时才改为 cuda，否则维持 none
+
+  # ASR：硅基流动 SenseVoiceSmall 免费，故默认开启
+  # ⚠️ 免费档随时可能变付费，budget.monthly_limit 是最后一道闸
+  asr:
+    enabled: true
+    provider: siliconflow
+    model: Qwen/Qwen3-ASR-1.7B         # ★ v1.4 更换：比 SenseVoiceSmall 更新更强，同为免费
+    fallback_provider: siliconflow
+    fallback_model: FunAudioLLM/SenseVoiceSmall   # 同为免费，先横向降级
+    # 跨供应商最终兜底（配置在 providers.bailian）：
+    #   fun-asr ¥0.016/分钟，450 分钟约 ¥7.2
+    max_duration_sec: 900              # ★ v1.4：500 条量级下放宽到 15 分钟
+    # 音频先转 mono 16kHz mp3 再上传：3 分钟约 1-3MB，远低于 50MB 上限
+    audio_bitrate: 32k
+    # 两者均无时间戳。如需「第几秒说了什么」的溯源，
+    # 改用本地 Whisper（2 核上约 1-2x 实时，450 分钟需 4-7 小时，不建议）
+    concurrency: 2
+
+# ────────────────────────────────────────────────────────────
+# OCR
+# ★ 本机器 2 核 i5-5200U，且官方文档实测 onnxruntime-gpu 在动态
+#   shape 下比 CPU 更慢（GTX 1660Super 上慢 2.2 倍），故固定 CPU
+# ────────────────────────────────────────────────────────────
+ocr:
+  # ★ 分层策略：本地 RapidOCR 打底，只有"搞不定"的图才送 API
+  #   ★ 用户已选定 hybrid
+  #   按 500 条 / 30% 视频实测口径，待处理图约 5100 张（2100 图文 + 3000 视频帧）：
+  #   local_only  全本地，不出网        约 57 分钟，2 核满载
+  #   hybrid      本地优先 + 复杂图送 API 约 35-40 分钟，出网约 20%（约 1000 张）★
+  #   api_only    全走 API              约 30 分钟，出网 100%
+  # → 500 条量级下三者速度差距不大，hybrid 的真正优势是「复杂图识别质量」而非耗时
+  strategy: hybrid
+
+  # ── 本地层 ──────────────────────────
+  engine: rapidocr                     # rapidocr | paddleocr
+  device: cpu                          # ★ 固定 cpu：官方实测动态 shape 下 GPU 更慢
+  workers: 3                           # ★ 2 核，留 1 核给系统
+  min_confidence: 0.5
+  skip_video_cover: false              # 视频封面通常带标题卡，要抽
+  max_side: 960                        # ★ 从 1600 降下来，2 核上提速约 2 倍
+
+  # ── API 层：本地搞不定时才调用 ───────
+  api:
+    provider: siliconflow
+    model: PaddlePaddle/PaddleOCR-VL-1.5       # 免费
+    fallback_provider: bailian
+    fallback_model: qwen3-vl-flash
+    # 触发送 API 的条件（任一命中）
+    escalate_on:
+      low_confidence: 0.6              # RapidOCR 平均置信度低于此值
+      too_short: 10                    # 识别出的字符数少于此值（可能是图表/手写）
+      has_table: true                  # 疑似表格（本地 OCR 表格还原差）
+    max_per_note: 3                    # 单条笔记最多几张走 API，控制出网量
+    concurrency: 6                     # ★ v1.4：500 条量级下从 3 提到 6（免费档限流未公开，实测再调）
+    timeout: 60
+    retry_on_429: 3                    # 限流退避重试次数
+    retry_backoff: [5, 15, 45]
+
+# ────────────────────────────────────────────────────────────
+# 索引与检索
+# ────────────────────────────────────────────────────────────
+embedding:
+  backend: api                         # ★ 固定 api，见 项目计划.md §0.4
+  local:
+    model: BAAI/bge-m3
+    device: cpu                        # 940M 2GB 放不下 FP32(2.28GB)，Maxwell FP16 不提速
+    batch_size: 8
+    max_length: 8192
+  api:
+    provider: siliconflow              # siliconflow | bailian | zhipu
+    model: BAAI/bge-m3                 # 免费
+    # 主供应商 429/失败时自动切换
+    fallback_provider: bailian
+    fallback_model: text-embedding-v4  # ¥0.617/M，全量约 ¥1
+    batch_size: 16                     # 单次最多 64 条，单条 ≤3072 tokens
+    max_length: 8192
+
+vectorstore:
+  backend: lancedb
+  table_name: xhs_notes
+  # 混合检索权重（RRF 融合，k=60）
+  hybrid:
+    rrf_k: 60
+    dense_topk: 50
+    sparse_topk: 50
+    bm25_topk: 50
+
+chunk:
+  # 小红书正文普遍很短，整篇入库优于切分
+  strategy: auto                       # auto | whole | sliding
+  whole_threshold: 800                 # 超过此字数才切
+  size: 800
+  overlap: 100
+
+rerank:
+  enabled: true                        # ★ 强烈建议开启，性价比最高
+  backend: api                         # ★ 固定 api：本地 15-25 秒/查询不可接受
+  local:
+    model: BAAI/bge-reranker-v2-m3
+    device: cpu
+  api:
+    provider: siliconflow
+    model: BAAI/bge-reranker-v2-m3      # 免费
+    fallback_provider: bailian
+    fallback_model: qwen3-rerank        # ¥0.62/M
+  top_k_in: 50
+  top_k_out: 5
+  # ★ 实测（2026-08-30）：分数是 sigmoid 归一化到 [0,1]，且强烈两极化 ——
+  #   强相关 0.9997 / 不相关 0.000016，中间值极少。
+  #   → 检索只能用【相对排序取 top_k】，绝不能设绝对阈值。
+  #     直觉上设 score > 0.5 会大量误杀真实相关结果。
+  #   → 若将来要「低于某分就不返回」，阈值必须实测标定，建议 ≤ 0.05。
+  min_score: null                       # null = 不设阈值，只按 top_k_out 截断
+  # 注意：API 响应里 document 字段默认返回 null，需靠 index 回查本地文档
+
+# ────────────────────────────────────────────────────────────
+# 问答
+# ────────────────────────────────────────────────────────────
+llm:
+  provider: deepseek                   # deepseek | glm | siliconflow | ollama
+  base_url: https://api.deepseek.com/v1
+  api_key_env: DEEPSEEK_API_KEY
+  model: deepseek-chat                 # ¥0.001/千 token 入，个人用量月均几毛
+  temperature: 0.2
+  max_tokens: 2000
+  # 零成本备选：智谱 GLM-4-Flash 完全免费（128K 上下文）
+  # provider: glm / base_url: https://open.bigmodel.cn/api/paas/v4
+  # model: glm-4-flash
+  # 硅基流动上 THUDM/GLM-4-9B-0414、GLM-Z1-9B-0414 也是免费档
+  # 本地兜底（2 核上很慢，仅应急）
+  ollama:
+    base_url: http://127.0.0.1:11434/v1
+    model: qwen3:8b
+
+# ────────────────────────────────────────────────────────────
+# 调度
+# ────────────────────────────────────────────────────────────
+schedule:
+  enabled: true
+  full_cron: "0 3 * * *"               # 每天 03:00 全量校对
+  incremental_cron: "0 15 * * *"       # 每天 15:00 增量
+  run_ocr_after_sync: true
+  run_index_after_sync: true
+
+# ────────────────────────────────────────────────────────────
+# 服务
+# ────────────────────────────────────────────────────────────
+serve:
+  # ★ 必须 0.0.0.0，绑 127.0.0.1 手机连不上
+  # 手机访问 http://192.168.5.69:8765（需与电脑同 WiFi）
+  # 首次需放行防火墙（管理员 PowerShell，一次性）：
+  #   New-NetFirewallRule -DisplayName "XHS-RAG" -Direction Inbound `
+  #     -LocalPort 8765 -Protocol TCP -Action Allow
+  host: 0.0.0.0
+  port: 8765
+  mcp_enabled: false
+  # ⚠️ 当前无鉴权，前提是「只在家庭局域网内使用」。
+  #    严禁端口映射到公网。远程访问请用 Tailscale。
+
+logging:
+  level: INFO
+  file: data/logs/xhs-rag.log
+  rotate: "10 MB"
+  retention: "30 days"

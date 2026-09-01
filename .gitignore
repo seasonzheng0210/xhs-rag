@@ -1,0 +1,33 @@
+# 密钥 —— 绝不入库
+.env
+*.key
+data/auth/
+
+# 运行时数据
+data/
+vault/
+config/config.yaml
+!config/config.example.yaml
+
+# 浏览器指纹目录（含登录态）
+data/browser_profile/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 内部文档（含 key 片段 / 爬虫策略细节，不公开）
+docs/
+
+# 日志
+logs/
+*.log
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
