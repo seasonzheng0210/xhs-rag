@@ -16,12 +16,12 @@ WORKDIR /app
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 
 # ── 2) 项目依赖(按 pyproject 可选组, 缓存友好: 代码改动不触发重装) ──
+# 先装 pinned 版本(lancedb/pyarrow 与本地索引格式兼容, 不可升级), 否则
+# `.[index]` 会先装最新版 lancedb 再被这里降级, 双倍下载/重装
 COPY pyproject.toml README.md ./
-RUN pip install --no-cache-dir ".[ocr,index,schedule]" \
- && pip install --no-cache-dir FlagEmbedding modelscope \
- # 锁定与本地数据兼容的版本: lancedb 索引是 0.37.1 写入的,
- # 新版本可能改文件格式; pyarrow 同理
- && pip install --no-cache-dir lancedb==0.37.1 pyarrow==25.0.1
+RUN pip install --no-cache-dir lancedb==0.37.1 pyarrow==25.0.1 \
+ && pip install --no-cache-dir ".[ocr,index,schedule]" \
+ && pip install --no-cache-dir FlagEmbedding modelscope
 
 # ── 3) 项目代码 ──
 COPY src/ ./src/
