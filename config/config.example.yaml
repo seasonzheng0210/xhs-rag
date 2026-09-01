@@ -317,6 +317,10 @@ serve:
   host: 0.0.0.0
   port: 8765
   mcp_enabled: false
+  # 调试模式: true 时接口报错会把完整 traceback 发给前端,
+  # 页面显示「查看错误详情 / 复制错误报告 / 去 WorkBuddy 修复」。
+  # 生产环境建议 false(不向客户端暴露堆栈细节)。
+  debug: false
   # ⚠️ 当前无鉴权，前提是「只在家庭局域网内使用」。
   #    严禁端口映射到公网。远程访问请用 Tailscale。
 

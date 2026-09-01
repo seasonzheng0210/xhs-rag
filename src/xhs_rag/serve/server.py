@@ -76,6 +76,19 @@ sup.cite{display:inline-block;min-width:15px;padding:0 3px;margin:0 1px;
 sup.cite:hover{background:var(--accent);color:#fff}
 .notice{font-size:12px;color:#8a6d3b;background:#fff8e6;border:1px solid #ffe6a8;
   border-radius:10px;padding:8px 12px;margin-bottom:12px}
+/* ── 调试模式: 错误卡片 ── */
+.errbox{background:#fff5f5;border:1px solid #ffcdd2;border-radius:10px;
+  padding:10px 12px;margin-bottom:12px;font-size:13px;color:#b71c1c}
+.errbox .msg{font-weight:600;margin-bottom:6px}
+.errbox .ops{display:flex;gap:8px;flex-wrap:wrap}
+.errbox button{font-size:12px;padding:5px 12px;border-radius:6px;border:1px solid #f0b4b4;
+  background:#fff;color:#b71c1c;cursor:pointer}
+.errbox button:hover{background:#ffe9e9}
+.errbox .trace{margin-top:8px;display:none}
+.errbox .trace pre{background:#2d2d2d;color:#e8e8e8;font-size:11px;line-height:1.5;
+  padding:10px;border-radius:6px;overflow-x:auto;max-height:260px;overflow-y:auto;
+  white-space:pre;margin:0}
+.errbox .copied{color:#2e7d32;font-size:12px;margin-top:6px;display:none}
 .footer{margin-top:18px;font-size:12px;color:var(--muted);text-align:center}
 .spin{display:inline-block;width:14px;height:14px;border:2px solid #ffd7dd;
   border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;
@@ -132,6 +145,8 @@ async function go(){
           const n=document.createElement('div');n.className='notice';
           n.textContent=d.message;
           $('#answer-box').appendChild(n);
+        }else if(d.type==='error'){  // 调试模式: 服务端抛异常, 带完整 traceback
+          showError(d.message,d.trace,d.q);
         }else if(d.type==='done'){
           // 生成完毕，把正文里的 [n] 统一渲染成可点击角标
           const b=$('#answer-box .body');
@@ -143,8 +158,52 @@ async function go(){
       }
     }
     if(!$('#answer-box .body'))$('#status').textContent='没有相关内容，换个关键词试试';
-  }catch(e){$('#status').textContent='请求失败：'+e}
+  }catch(e){showError('请求失败：'+e,null)}
   finally{loading=false;$('#btn').disabled=false}
+}
+// ── 调试模式: 错误卡片(查看 traceback / 复制报告 / 跳转 WorkBuddy) ──
+let lastReport='';
+function showError(msg,trace,q){
+  $('#status').textContent='';$('#answer-box').innerHTML='';$('#results').innerHTML='';
+  const lines=['======== xhs-rag 错误报告 ========',
+    '时间: '+new Date().toLocaleString('zh-CN',{hour12:false}),
+    '问题: '+(q||$('#q').value||'(空)'),
+    '错误: '+msg];
+  if(trace&&trace.length)lines.push('Traceback:',...trace);
+  lines.push('====================================',
+    '把以上内容完整粘贴给 WorkBuddy 对话，即可获得修复方案。');
+  lastReport=lines.join('\n');
+  const box=document.createElement('div');box.className='errbox';
+  box.innerHTML=
+    '<div class="msg">⚠️ '+esc(msg)+'</div>'+
+    '<div class="ops">'+
+      '<button onclick="toggleTrace(this)">查看错误详情</button>'+
+      '<button onclick="copyReport(this)">复制错误报告</button>'+
+      '<button onclick="goWorkbuddy(this)">去 WorkBuddy 修复</button>'+
+    '</div>'+
+    '<div class="trace"><pre>'+esc(trace?trace.join('\n'):'(无 traceback，请查看 data/logs/xhs-rag.log)')+'</pre></div>'+
+    '<div class="copied"></div>';
+  $('#answer-box').appendChild(box);
+}
+function toggleTrace(btn){
+  const t=btn.closest('.errbox').querySelector('.trace');
+  const show=t.style.display!=='block';t.style.display=show?'block':'none';
+  btn.textContent=show?'收起错误详情':'查看错误详情';
+}
+async function copyReport(btn){
+  try{await navigator.clipboard.writeText(lastReport)}
+  catch(e){const ta=document.createElement('textarea');ta.value=lastReport;
+    document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove()}
+  const box=btn.closest('.errbox');const c=box.querySelector('.copied');
+  c.textContent='✅ 错误报告已复制';c.style.display='block';
+}
+function goWorkbuddy(btn){
+  copyReport(btn).then(()=>{
+    const box=btn.closest('.errbox');const c=box.querySelector('.copied');
+    c.textContent='✅ 已复制！打开 WorkBuddy 对话，直接粘贴即可获得修复方案';
+    c.style.display='block';
+    if(box.scrollIntoView)box.scrollIntoView({behavior:'smooth',block:'nearest'});
+  });
 }
 function render(items){
   const box=$('#results');box.innerHTML='';
@@ -204,6 +263,7 @@ class Handler(BaseHTTPRequestHandler):
     db: DB = None
     db_path: str = ""
     answerer = None  # qa.Answerer，未配置则 None
+    debug: bool = False  # 调试模式: 错误响应携带完整 traceback, 前端可查看/复制/跳 WorkBuddy
 
     def _db_conn(self):
         """每请求新建 sqlite 连接(sqlite 连接不能跨线程)。"""
@@ -265,6 +325,35 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ── 调试模式: 错误报告 ────────────────────────────────
+    def _err_body(self, where: str, exc: Exception) -> dict:
+        """构造错误响应体。调试模式携带完整 traceback, 生产模式只给消息。"""
+        import traceback as tb
+
+        body = {"error": f"{where}: {exc}"}
+        if self.debug:
+            body["trace"] = tb.format_exc().splitlines()
+            body["debug"] = True
+        return body
+
+    def _report_text(self, q: str, exc: Exception, path: str = "") -> str:
+        """生成可直接粘贴给 WorkBuddy 的错误报告文本。"""
+        import datetime
+        import traceback as tb
+
+        lines = [
+            "======== xhs-rag 错误报告 ========",
+            f"时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"接口: {path or self.path}",
+            f"问题: {q}",
+            f"错误: {type(exc).__name__}: {exc}",
+            "Traceback:",
+        ]
+        lines += tb.format_exc().splitlines()
+        lines.append("====================================")
+        lines.append("把以上内容完整粘贴给 WorkBuddy 即可获得修复方案。")
+        return "\n".join(lines)
+
     def _html(self, body: bytes):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -288,7 +377,7 @@ class Handler(BaseHTTPRequestHandler):
                             "results": results})
             except Exception as e:
                 logger.exception("搜索失败")
-                self._json({"error": str(e)}, 500)
+                self._json(self._err_body("搜索失败", e), 500)
         elif url.path == "/api/answer":
             self._handle_answer(url)
         elif url.path == "/api/stats":
@@ -347,7 +436,12 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:  # 含 LLMUnavailable 与客户端断开
             logger.warning(f"问答失败: {e}")
             try:
-                self._sse({"type": "notice", "message": f"AI 回答失败：{e}"})
+                if self.debug:
+                    self._sse({"type": "error", "message": f"AI 回答失败：{e}",
+                               "trace": __import__("traceback").format_exc().splitlines(),
+                               "q": q, "path": self.path})
+                else:
+                    self._sse({"type": "notice", "message": f"AI 回答失败：{e}"})
                 self._sse({"type": "done", "search_secs": 0, "llm_secs": 0})
             except Exception:
                 pass  # 客户端已断开，忽略
@@ -426,11 +520,14 @@ def serve(cfg: Config) -> int:
     Handler.db = db
     Handler.db_path = str(cfg.path("paths.db"))
     Handler.answerer = _build_answerer(cfg)
+    Handler.debug = bool(cfg.get("serve.debug", False))  # 调试模式(错误详情+跳转修复)
 
     host = cfg.get("serve.host", "0.0.0.0")
     port = int(cfg.get("serve.port", 8765))
     httpd = ThreadingHTTPServer((host, port), Handler)
     ip = lan_ip()
+    if Handler.debug:
+        logger.info("调试模式已开启: 接口报错时前端可查看 traceback / 复制错误报告 / 跳转修复")
     logger.success(
         f"Web UI 已启动: 本机 http://127.0.0.1:{port}  手机 http://{ip}:{port}"
     )
