@@ -1,6 +1,8 @@
 ---
 name: xhs-rag
 description: 小红书收藏夹 RAG —— 把用户自己在小红书收藏/点赞过的笔记变成可搜索、可问答、能回溯原帖的个人知识库。当用户说「建立小红书 RAG / 问我的小红书收藏 / 检索我收藏的笔记 / 把收藏夹做成知识库 / 用小红书收藏回答我」或需要对自己的小红书收藏做语义检索、带引用问答、MCP 接入时使用。只采集本人账号数据，Markdown 落盘本地优先。
+license: MIT
+compatibility: 需要 Python >= 3.11 与 ffmpeg；本地检索模型 bge-m3/bge-reranker（torch CPU）；可选 SiliconFlow/Zhipu/DeepSeek API key
 ---
 
 # xhs-rag · 小红书收藏夹 RAG
