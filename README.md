@@ -5,6 +5,13 @@ Markdown 落盘，Obsidian 可直接打开；数据全部留在本机。
 
 > 合规：仅采集**本人账号**的收藏内容，低频、不外传、不商用。
 
+## 怎么用（两种形态）
+
+| 形态 | 入口 | 适合谁 |
+|---|---|---|
+| **命令行 / Web UI** | `xhs setup` 一键建库 → `xhs serve` 开 Web 问答 | 想自己检索收藏的人 |
+| **AI 助手（MCP / Skill）** | 仓库根 [`SKILL.md`](SKILL.md) 教 AI 读懂本项目；`xhs mcp` 把 search/ask/stats 暴露成 MCP 工具 | 想让 WorkBuddy / Claude 等直接「问我的收藏」的人（接入见 [M9](#mcp-接入m9)） |
+
 ## 功能
 
 | 里程碑 | 内容 | 状态 |
@@ -61,9 +68,18 @@ pip install -e ".[ocr,index,serve]"
 pip install "mcp<2"      # 可选：仅 M9 MCP 接入需要
 playwright install chromium
 
-# 1. 配置密钥（可选，仅 API 降级链路需要）
+# 0b. 检索模型（二选一，检索/问答必需）
+#    A. 本地模型（推荐：免费、无限量、数据不出本机）—— 首次建索引自动下载到 data/models/
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # CPU 版即可
+pip install flagembedding modelscope
+#    B. 或配云端 embedding API key（见 .env.example，本地模型缺省时自动降级）
+
+# 1. 配置密钥（可选，仅 API 降级链路 / LLM 问答需要）
 cp .env.example .env          # 填入 SILICONFLOW_API_KEY 等
 python scripts/verify_keys.py
+
+# ※ config.yaml 无需手动创建：代码自动回退 config/config.example.yaml（含默认路径/模型名）。
+#   需要改参数（如 rerank.top_k_in、llm.provider、serve.debug）时再 cp config.example.yaml config.yaml 覆盖。
 
 # 2a. 最快路径：一键建库（登录失效会自动弹码 → 全流水线 → 完事）
 python -m xhs_rag.cli setup
@@ -103,6 +119,7 @@ Windows 下也可双击 [`scripts/run.bat`](scripts/run.bat)。
 ## MCP 接入（M9）
 
 把收藏 RAG 的 `search` / `ask` / `stats` 暴露为 MCP 工具，**AI 客户端无需开浏览器即可直问你的收藏库**。
+也适合作为仓库根 `SKILL.md` 的运行时后端：AI 助手读 SKILL.md 学会本项目，再经 MCP 直查你的数据。
 
 ```bash
 pip install "mcp<2"   # v1 API（FastMCP）；mcp 2.x 改名为 MCPServer，本项目代码按 v1 写
@@ -115,13 +132,16 @@ WorkBuddy 注册 —— 在 `~/.workbuddy/mcp.json` 的 `mcpServers` 加一条�
 {
   "mcpServers": {
     "xhs-rag": {
-      "command": "C:/Users/Administrator/.workbuddy/binaries/python/envs/xhs-rag/Scripts/python.exe",
+      "command": "<你的 venv 或系统 python 绝对路径>",
       "args": ["-m", "xhs_rag.cli", "mcp"],
-      "cwd": "C:/Users/Administrator/.workbuddy/2026-08-29-16-20-26/xhs-rag"
+      "cwd": "<克隆本仓库的绝对路径>"
     }
   }
 }
 ```
+
+> 把两个 `<...>` 占位符换成你机器上的真实路径：`command` 指向装好依赖的 python（`pip install -e ".[ocr,index,serve]"` 后可直接用系统 python），`cwd` 指向本仓库目录。
+> 首次调用会预热本地模型（embedder + reranker，约 10-20s），之后即时响应。
 
 可用工具：
 

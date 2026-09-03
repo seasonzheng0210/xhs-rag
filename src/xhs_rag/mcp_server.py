@@ -4,8 +4,9 @@
 
 接入方式（WorkBuddy）—— 在 ~/.workbuddy/mcp.json 的 mcpServers 加一条：
     "xhs-rag": {
-        "command": "C:/Users/Administrator/.workbuddy/binaries/python/envs/xhs-rag/Scripts/python.exe",
-        "args": ["-m", "xhs_rag.cli", "mcp"]
+        "command": "<装好依赖的 python 绝对路径>",   # 如 venv 的 python.exe
+        "args": ["-m", "xhs_rag.cli", "mcp"],
+        "cwd": "<克隆本仓库的绝对路径>"
     }
 然后在本模块目录用 `python -m xhs_rag.cli mcp` 也能直接以 stdio 跑。
 

@@ -2,10 +2,9 @@
 name = "xhs-rag"
 version = "0.1.0"
 description = "小红书收藏夹 RAG：把收藏过的笔记变成可搜索、可问答、能回溯原帖的个人知识库"
-requires-python = ">=3.11"
 readme = "README.md"
-
-# M0 阶段只依赖这些，装得快。后续阶段的依赖见下方可选组。
+license = { text = "MIT" }
+requires-python = ">=3.11"
 dependencies = [
     "playwright>=1.44",
     "pyyaml>=6.0",

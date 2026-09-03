@@ -8,18 +8,20 @@ from __future__ import annotations
 import anyio
 import json
 import sys
+from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 PY = sys.executable
+ROOT = Path(__file__).resolve().parents[1]  # scripts/ 的上一级 = 项目根
 
 
 async def main() -> None:
     params = StdioServerParameters(
         command=PY,
         args=["-m", "xhs_rag.cli", "mcp"],
-        cwd="C:/Users/Administrator/.workbuddy/2026-08-29-16-20-26/xhs-rag",
+        cwd=str(ROOT),
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
