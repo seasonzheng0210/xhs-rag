@@ -116,7 +116,8 @@ WorkBuddy 注册 —— 在 `~/.workbuddy/mcp.json` 的 `mcpServers` 加一条�
   "mcpServers": {
     "xhs-rag": {
       "command": "C:/Users/Administrator/.workbuddy/binaries/python/envs/xhs-rag/Scripts/python.exe",
-      "args": ["-m", "xhs_rag.cli", "mcp"]
+      "args": ["-m", "xhs_rag.cli", "mcp"],
+      "cwd": "C:/Users/Administrator/.workbuddy/2026-08-29-16-20-26/xhs-rag"
     }
   }
 }
