@@ -14,10 +14,11 @@ Markdown 落盘，Obsidian 可直接打开；数据全部留在本机。
 | **M2** | 笔记详情 + 图片 / 视频下载（`xsec_token` 原样保留） | ✅ |
 | **M3** | 图片 OCR（RapidOCR 本地 + API 混合降级）+ Markdown 落盘 | ✅ |
 | **M4** | 视频抽帧 OCR + ASR 转写 | ✅ |
-| **M5** | 索引与检索（bge-m3 embedding + bge-reranker 重排，LanceDB） | ✅ |
+| **M5** | 索引与检索（bge-m3 embedding + **BM25+RRF 混合检索** + bge-reranker 重排，LanceDB） | ✅ |
 | **M6** | Web UI（移动端优先，局域网手机可访问） | ✅ |
-| **M7** | 定时增量同步（每日自动 collect → 详情 → OCR → ASR → 索引） | ✅ |
+| **M7** | 增量同步（collect → 详情 → OCR → ASR → 索引，可单次执行或由外部定时驱动） | ✅（内置 scheduler 未实现，定时依赖外部如 WorkBuddy 自动化） |
 | **M8** | LLM 问答（检索结果 → 带 `[n]` 引用的流式回答，点角标跳原帖） | ✅ |
+| **M9** | MCP server（stdio，把 search / ask / stats 暴露给 WorkBuddy 等 AI 客户端直问收藏夹） | ✅ |
 
 ## 数据流
 
@@ -56,14 +57,18 @@ Markdown 落盘，Obsidian 可直接打开；数据全部留在本机。
 
 ```bash
 # 0. 安装
-pip install -e ".[ocr,index,serve,schedule]"
+pip install -e ".[ocr,index,serve]"
+pip install "mcp<2"      # 可选：仅 M9 MCP 接入需要
 playwright install chromium
 
 # 1. 配置密钥（可选，仅 API 降级链路需要）
 cp .env.example .env          # 填入 SILICONFLOW_API_KEY 等
 python scripts/verify_keys.py
 
-# 2. 扫码登录（首次弹出浏览器窗口，扫码后登录态持久化）
+# 2a. 最快路径：一键建库（登录失效会自动弹码 → 全流水线 → 完事）
+python -m xhs_rag.cli setup
+
+# 2b. 或分步执行：扫码登录（首次弹出浏览器窗口，扫码后登录态持久化）
 python -m xhs_rag.cli login
 
 # 3. 全流水线同步（收藏 → 详情 → OCR → ASR → 索引）
@@ -74,6 +79,9 @@ python -m xhs_rag.cli serve
 
 # 5. 命令行问答（不想开浏览器时，检索 + LLM 带引用回答）
 python -m xhs_rag.cli ask "月子里怎么吃"
+
+# 6. MCP server（可选，AI 客户端如 WorkBuddy 直问收藏夹，接入见下文 M9）
+python -m xhs_rag.cli mcp
 ```
 
 Windows 下也可双击 [`scripts/run.bat`](scripts/run.bat)。
@@ -87,8 +95,49 @@ Windows 下也可双击 [`scripts/run.bat`](scripts/run.bat)。
 | `python -m xhs_rag.cli check` | 登录态检查（`--offline` 只查本地文件） |
 | `python -m xhs_rag.cli collect` | 同步收藏列表到 SQLite + JSONL |
 | `python -m xhs_rag.cli sync` | 全流水线：collect → detail → OCR → ASR → 增量索引 |
+| `python -m xhs_rag.cli setup` | **一键建库**：登录检查（失效自动弹扫码）→ 全流水线 →（`--serve` 连 Web UI） |
 | `python -m xhs_rag.cli serve` | 启动 Web UI（检索 + 问答） |
 | `python -m xhs_rag.cli ask "问题"` | 命令行问答：检索 + LLM 带引用回答（`-k` 控制片段数） |
+| `python -m xhs_rag.cli mcp` | 启动 MCP server（stdio，供 WorkBuddy 等 AI 客户端接入收藏夹问答） |
+
+## MCP 接入（M9）
+
+把收藏 RAG 的 `search` / `ask` / `stats` 暴露为 MCP 工具，**AI 客户端无需开浏览器即可直问你的收藏库**。
+
+```bash
+pip install "mcp<2"   # v1 API（FastMCP）；mcp 2.x 改名为 MCPServer，本项目代码按 v1 写
+python -m xhs_rag.cli mcp    # 手动以 stdio 方式跑起来，可配合任意 MCP client 调试
+```
+
+WorkBuddy 注册 —— 在 `~/.workbuddy/mcp.json` 的 `mcpServers` 加一条，然后到连接器管理页对 `xhs-rag` 点「信任」：
+
+```json
+{
+  "mcpServers": {
+    "xhs-rag": {
+      "command": "C:/Users/Administrator/.workbuddy/binaries/python/envs/xhs-rag/Scripts/python.exe",
+      "args": ["-m", "xhs_rag.cli", "mcp"]
+    }
+  }
+}
+```
+
+可用工具：
+
+| 工具 | 参数 | 说明 |
+|---|---|---|
+| `search` | `query`, `k=5` | 语义检索收藏夹，返回带原帖链接的结果 |
+| `ask` | `query` | 检索 + LLM 生成带 `[n]` 引用的回答（LLM 不可用退化为检索） |
+| `stats` | — | 收藏库统计：笔记 / 图片 / 视频 / ASR 字符 / chunks |
+
+实现要点（都是踩过的坑）：
+
+- **stdout 只走协议**：MCP stdio 要求 stdout 只承载 JSON-RPC。CLI 默认把 loguru 打到 stdout（带 ANSI 颜色），
+  任何一行日志混入都会让客户端解析失败 —— `mcp_server.main()` 里强制把日志全部改道 stderr。
+- **预热必须在主线程**：MCP 工具在 anyio worker 线程执行，实测在 worker 线程内首次 import torch / 加载
+  bge-m3 会死等挂起（0 CPU、内存停在 ~150MB）；因此模型预热放在 `mcp.run()` 之前的主线程做（约 10-20s，
+  与 web serve 同策略），启动即就绪、工具调用即时返回。
+- **mcp 版本钉 `<2`**：2.x 把 `FastMCP` 改名为 `MCPServer`，本项目按 v1 API 编写。
 
 ## LLM 问答（M8）
 

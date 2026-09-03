@@ -1,7 +1,9 @@
-"""M5 检索 —— 语义检索 + rerank 重排。
+"""M5 检索 —— 混合检索(hybrid) + rerank 重排。
 
 流程:
-  query → bge-m3 编码 → LanceDB cosine 搜索(top_k_in) → bge-reranker-v2-m3 重排(top_k_out)
+  query → bge-m3 编码 → LanceDB cosine 搜索(top_k_in)
+       → RRF 融合 BM25 关键词命中(可选, retrieval.hybrid, 默认开; 失败自动退回纯向量)
+       → bge-reranker-v2-m3 重排(top_k_out)
 rerank 模型本地化(bge-reranker-v2-m3,约 2.3GB,首次下载后常驻内存)。
 """
 from __future__ import annotations
@@ -23,8 +25,11 @@ class Retriever:
         self.table_name = cfg.get("vectorstore.table_name", "xhs_notes")
         self.top_k_in = int(cfg.get("rerank.top_k_in", 50))
         self.top_k_out = int(cfg.get("rerank.top_k_out", 5))
+        self.hybrid = bool(cfg.get("retrieval.hybrid", True))  # BM25 + 向量 RRF 融合
         self._reranker = None
         self._table = None
+        self._bm25 = None  # CorpusBM25(懒加载,行数变化自动重建)
+        self._bm25_n = -1
         # 检索结果缓存: query → (时间戳, results)。rerank CPU 推理是主要耗时,
         # 相同/相近 query 短时间重复搜索直接秒回
         self._search_cache: dict[str, tuple[float, list[dict]]] = {}
@@ -45,6 +50,48 @@ class Retriever:
             db = lancedb.connect(str(self.lance_dir))
             self._table = db.open_table(self.table_name)
         return self._table
+
+    def _bm25_search(self, query: str, k: int) -> list[dict]:
+        """懒加载语料并检索 BM25。语料行数与索引表不一致(增量同步后)自动重建。"""
+        from .bm25 import CorpusBM25
+
+        tbl = self._get_table()
+        n = tbl.count_rows()
+        if self._bm25 is None or n != self._bm25_n:
+            # 投影需要的列即可;不用 to_lance()——lancedb 0.38 那要可选依赖 pylance。
+            # seq 规整为 int/None,避免 np.int64 混进结果让 json.dumps 炸掉。
+            df = tbl.to_pandas()
+            df = df[["note_id", "seq", "title", "section", "text"]]
+            rows = df.to_dict("records")
+            for r in rows:
+                r["seq"] = None if r["seq"] is None else int(r["seq"])
+                for c in ("title", "section", "text"):
+                    if r[c] is None:
+                        r[c] = ""
+            self._bm25 = CorpusBM25(rows)
+            self._bm25_n = n
+            logger.info(f"BM25 语料就绪: {self._bm25.n} chunks")
+        return self._bm25.search(query, k)
+
+    @staticmethod
+    def _rrf_merge(dense: list[dict], sparse: list[dict],
+                   limit: int, k: int = 60) -> list[dict]:
+        """Reciprocal Rank Fusion: score = Σ 1/(k + rank),取两路前 limit 候选。
+
+        以 (note_id, seq) 为键合并(seq 缺省退化为 note_id),返回保持各自字段的
+        行对象列表,按融合分降序截断 —— rerank 前的候选池,不改变下游字段契约。
+        """
+        from collections import defaultdict
+
+        scores: dict[tuple, float] = defaultdict(float)
+        row_by_key: dict[tuple, dict] = {}
+        for rank, hit in enumerate(dense + sparse):
+            key = (hit["note_id"], hit.get("seq"))
+            scores[key] += 1.0 / (k + rank + 1)
+            if key not in row_by_key:
+                row_by_key[key] = hit
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [row_by_key[key] for key, _ in ranked[:limit]]
 
     def _ensure_reranker(self):
         """懒加载本地 bge-reranker-base。"""
@@ -101,6 +148,16 @@ class Retriever:
         hits = tbl.search(qvec).limit(top_k_in).to_list()
         if not hits:
             return []
+
+        # 2.5) hybrid: 与 BM25 结果做 RRF 融合(关键词精确命中常在 OCR 噪声 chunk
+        #      里被向量检索埋掉;失败/不可用一律退回纯向量,不影响检索)
+        if self.hybrid:
+            try:
+                sparse = self._bm25_search(query, top_k_in)
+                if sparse:
+                    hits = self._rrf_merge(hits, sparse, top_k_in)
+            except Exception as e:
+                logger.warning(f"hybrid BM25 检索失败,退回纯向量: {e}")
 
         # 3) rerank 重排(候选截断 160 字符,CPU 推理与长度近似线性,越短越快)
         candidates = [h["text"][:160] for h in hits]

@@ -101,14 +101,23 @@ class Indexer:
             logger.info(f"追加 {len(rows)} rows 到已有表 {self.table_name}")
         else:
             tbl = db.create_table(self.table_name, data=rows)
-        # 建向量索引(加速检索)
-        try:
-            tbl.create_index(
-                metric="cosine", index_type="IVF_PQ", num_partitions=8, num_sub_vectors=64
-            )
-            logger.info("向量索引(IVF_PQ)创建完成")
-        except Exception as e:
-            logger.warning(f"向量索引创建失败(不影响检索): {e}")
+        # 向量索引: 只在语料够大时建 ANN。
+        # IVF_PQ 的 num_partitions/nprobes 是给大表调的;几百行的小表建了反而
+        # 召回饿死(空分区多 → 实际返回远少于 limit,实测 218 行只回 ~6 条)。
+        # 小表直接 flat 精确扫描,毫秒级且召回=全表。
+        if len(rows) >= int(self.cfg.get("vectorstore.ann_min_rows", 20000)):
+            try:
+                tbl.create_index(
+                    metric="cosine", index_type="IVF_PQ",
+                    num_partitions=16, num_sub_vectors=64,
+                )
+                logger.info("语料规模达标,向量索引(IVF_PQ)创建完成")
+            except Exception as e:
+                logger.warning(f"向量索引创建失败(不影响检索): {e}")
+        else:
+            logger.info(
+                f"语料 {len(rows)} 行 < ann_min_rows,保持 flat 精确扫描"
+                "(小表 ANN 会饿死召回)")
 
         logger.success(f"M5 索引完成: {len(mds)} 篇, {len(rows)} chunks")
         return {"md": len(mds), "chunks": len(rows), "skip_md": len(indexed)}

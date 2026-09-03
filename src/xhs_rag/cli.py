@@ -491,6 +491,54 @@ def cmd_sync(cfg: Config, headless: bool = False,
     return 1 if bad else 0
 
 
+# ── setup ────────────────────────────────────────────────
+def cmd_setup(cfg: Config, login_timeout: int = 180, headless: bool = False,
+              max_pages: int = 50, skip_media: bool = False,
+              serve: bool = False) -> int:
+    """一键建库：登录态检查(失效才扫码) → 全流水线同步 → 汇报。
+
+    面向新机器 / 新用户：一条命令跑完「登录 → 收藏 → 详情 → OCR → ASR → 索引」。
+    最后一步是可选的 Web UI 启动（--serve，会阻塞前台）。
+    """
+    t0 = time.time()
+    logger.info("===== xhs setup 开始 =====")
+    steps: list[tuple[str, int]] = []
+
+    # 1) 登录态：先服务端核验，失效才弹扫码窗
+    logger.info("[1/3] 检查登录态...")
+    if cmd_check(cfg, online=True) == 0:
+        logger.success("登录态有效")
+    else:
+        logger.warning("登录态失效或不存在，弹出浏览器扫码（{}s 超时）...", login_timeout)
+        cmd_login(cfg, timeout=login_timeout)
+        if cmd_check(cfg, online=True) != 0:
+            logger.error("扫码后登录态仍未通过服务端核验。"
+                         "请重跑 setup，或单独执行: python -m xhs_rag.cli login")
+            return 1
+        logger.success("扫码登录成功")
+    steps.append(("登录", 0))
+
+    # 2) 全流水线同步（各环节断点续传，重复跑只处理增量）
+    logger.info("[2/3] 全流水线同步 (collect→detail→ocr→video→index)...")
+    rc = cmd_sync(cfg, headless=headless, max_pages=max_pages,
+                  skip_media=skip_media)
+    steps.append(("同步", rc))
+    if rc:
+        logger.error("同步链路有环节失败，见上方日志。可重跑 setup 续传。")
+
+    # 3) 汇报 + 可选 Web UI
+    dur = time.time() - t0
+    if serve:
+        url = f"http://{cfg.get('serve.host', '0.0.0.0')}:{cfg.get('serve.port', 8765)}"
+        logger.info(f"[3/3] 启动 Web UI: {url}（Ctrl+C 停止）")
+        cmd_serve(cfg)
+    else:
+        logger.info("[3/3] 建库完成")
+        logger.success(f"===== xhs setup 结束, 耗时 {dur:.0f}s =====")
+        logger.info("下一步: python -m xhs_rag.cli serve  # 启动 Web UI（手机同局域网可访问）")
+    return 1 if any(r for _, r in steps if r) else 0
+
+
 # ── serve ────────────────────────────────────────────────
 def cmd_serve(cfg: Config) -> int:
     """M6：启动 Web UI(模型常驻,手机可访问)。"""
@@ -537,7 +585,14 @@ def main(argv: list[str] | None = None) -> int:
     p_sync.add_argument("--headless", action="store_true", help="无头模式（定时任务用，风控更严）")
     p_sync.add_argument("--max-pages", type=int, default=50, help="收藏列表翻页上限")
     p_sync.add_argument("--skip-media", action="store_true", help="跳过媒体下载，只抓详情")
+    p_setup = sub.add_parser("setup", help="一键建库：登录检查(必要时扫码) → 全流水线 → (可选)启动 Web UI")
+    p_setup.add_argument("--login-timeout", type=int, default=180, help="扫码等待秒数")
+    p_setup.add_argument("--headless", action="store_true", help="同步用无头模式（不推荐）")
+    p_setup.add_argument("--max-pages", type=int, default=50, help="收藏列表翻页上限")
+    p_setup.add_argument("--skip-media", action="store_true", help="跳过媒体下载，只抓详情")
+    p_setup.add_argument("--serve", action="store_true", help="同步完直接启动 Web UI（阻塞）")
     sub.add_parser("serve", help="启动 Web UI（M6，手机可访问）")
+    sub.add_parser("mcp", help="启动 MCP server（stdio，供 WorkBuddy 等 AI 客户端接入收藏夹问答）")
 
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
@@ -569,8 +624,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sync":
         return cmd_sync(cfg, headless=args.headless,
                         max_pages=args.max_pages, skip_media=args.skip_media)
+    if args.cmd == "setup":
+        return cmd_setup(cfg, login_timeout=args.login_timeout,
+                         headless=args.headless, max_pages=args.max_pages,
+                         skip_media=args.skip_media, serve=args.serve)
     if args.cmd == "serve":
         return cmd_serve(cfg)
+    if args.cmd == "mcp":
+        from .mcp_server import main as mcp_main
+
+        return mcp_main()
     return 1
 
 
