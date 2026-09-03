@@ -22,6 +22,9 @@ venv/
 # 内部文档（含 key 片段 / 爬虫策略细节，不公开）
 docs/
 
+# 本机工作区元数据（WorkBuddy 记忆/自动化日志，含机器路径）
+.workbuddy/
+
 # 本机专属脚本（换机/沙箱 hack，含绝对路径，不公开）
 scripts/extract_torch.py
 
