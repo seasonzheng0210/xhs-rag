@@ -126,10 +126,12 @@ Windows 下也可双击 [`scripts/run.bat`](scripts/run.bat)。
 | `scripts/eval_retrieval.py` | 检索质量（dense / hybrid / hybrid+rerank 三模式对比） | Recall@5 / MRR@10 / nDCG@5 |
 | `scripts/eval_answers.py` | 回答质量（LLM-as-judge 三维） | faithfulness / relevance / citation |
 | `scripts/eval_ragas.py` | 生成端 RAGAS 四指标（自实现，零重依赖，不装官方 ragas） | faithfulness / answer_relevancy / context_precision / context_recall |
+| `scripts/test_agent_cases.py` | Agent 决策循环行为测试（单跳 / 多跳 / 无结果负例 / 超步数收尾 / stats） | 逐条断言，5/5 通过 |
 
 ```bash
 python scripts/eval_retrieval.py --mode all      # 检索三模式对比
 python scripts/eval_ragas.py --n 6 --verbose     # RAGAS 四指标（--out 存明细）
+python scripts/test_agent_cases.py               # Agent 行为测试（约 1 分钟）
 ```
 
 RAGAS 指标按论文口径自实现：faithfulness=有依据原子陈述占比、answer_relevancy=
