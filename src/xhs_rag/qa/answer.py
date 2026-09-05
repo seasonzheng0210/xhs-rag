@@ -110,10 +110,10 @@ class Answerer:
             return False
         return True
 
-    def rewrite_query(self, query: str, history: list[dict]) -> str:
+    def rewrite_query(self, query: str, history: list[dict] | None = None) -> str:
         """结合对话历史把追问改写成独立检索词。失败时原样返回(不影响主流程)。"""
         msgs = [{"role": "system", "content": REWRITE_PROMPT}]
-        for h in history[-4:]:  # 最多带 2 轮(4 条),改写不需要更长
+        for h in (history or [])[-4:]:  # 最多带 2 轮(4 条),改写不需要更长
             msgs.append({"role": h.get("role", "user"),
                          "content": (h.get("content") or "")[:400]})
         msgs.append({"role": "user", "content": query})

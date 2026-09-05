@@ -467,7 +467,12 @@ class Handler(BaseHTTPRequestHandler):
         self._sse_head()
         try:
             t0 = time.time()
-            results = self._enrich(self.retriever.search(search_q))
+            # CRAG-lite: 低置信时用 LLM 改写重检一次(LLM 不可用则退纯检索)
+            rewrite_fn = None
+            if self.answerer is not None:
+                rewrite_fn = lambda qq: self.answerer.rewrite_query(qq)  # noqa: E731
+            results = self._enrich(self.retriever.search(search_q,
+                                                         rewrite_fn=rewrite_fn))
             search_secs = round(time.time() - t0, 1)
             meta = {"type": "meta", "q": q, "secs": search_secs,
                     "results": results}

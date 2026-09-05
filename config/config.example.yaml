@@ -249,6 +249,12 @@ chunk:
   size: 800
   overlap: 100
 
+retrieval:
+  hybrid: true                         # BM25+向量 RRF 融合(失败自动退纯向量)
+  crag:                                # CRAG-lite: 低置信自动改写重检一次
+    enabled: true
+    min_top1_score: 0.75               # normalize 后 sigmoid 分数, 实测标定
+
 rerank:
   enabled: true                        # ★ 强烈建议开启，性价比最高
   backend: api                         # ★ 固定 api：本地 15-25 秒/查询不可接受

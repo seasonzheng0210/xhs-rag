@@ -136,7 +136,10 @@ def _tool_ask(query: str, history: list[dict] | None = None) -> str:
         except Exception:
             search_q = q
     t0 = time.time()
-    results = _enrich(ctx["retriever"].search(search_q))
+    rewrite_fn = None
+    if ctx["answerer"] is not None:
+        rewrite_fn = lambda qq: ctx["answerer"].rewrite_query(qq)  # noqa: E731
+    results = _enrich(ctx["retriever"].search(search_q, rewrite_fn=rewrite_fn))
     out: dict = {"query": q, "search_secs": round(time.time() - t0, 1),
                  "answer": "", "model": "", "results": [_trim(r, 200) for r in results]}
     if search_q != q:

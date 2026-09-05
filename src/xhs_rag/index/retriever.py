@@ -26,6 +26,12 @@ class Retriever:
         self.top_k_in = int(cfg.get("rerank.top_k_in", 50))
         self.top_k_out = int(cfg.get("rerank.top_k_out", 5))
         self.hybrid = bool(cfg.get("retrieval.hybrid", True))  # BM25 + 向量 RRF 融合
+        # CRAG-lite: 检索质量自评 + 改写重检(Corrective RAG 简化版)
+        # top1 rerank 分数低于阈值 → 视为"库里大概率没有相关内容",
+        # 注入 rewrite_fn 时自动改写重检一次; 仍低则结果标 low_confidence
+        # (bge-reranker 分数 sigmoid 两极化: 相关 ~0.9+, 无关 ~1e-4 量级)
+        self.crag_enabled = bool(cfg.get("retrieval.crag.enabled", True))
+        self.crag_min_score = float(cfg.get("retrieval.crag.min_top1_score", 0.05))
         self._reranker = None
         self._table = None
         self._bm25 = None  # CorpusBM25(懒加载,行数变化自动重建)
@@ -121,13 +127,17 @@ class Retriever:
         logger.info(f"reranker 加载完成, torch threads={torch.get_num_threads()}")
         return self._reranker
 
-    def search(self, query: str, k: int | None = None) -> list[dict]:
+    def search(self, query: str, k: int | None = None,
+               rewrite_fn=None) -> list[dict]:
         """检索并重排,返回 [{note_id, title, section, text, score, url}]。
 
-        返回前做同笔记补全: rerank 只用片段前 200 字符打分,
-        配方/做法类笔记的用量常在图 OCR chunk 里(开头是 OCR 噪声,打分极低),
-        会被挤出 topN 导致 LLM 看不到关键数字。因此只要某笔记有一个
-        chunk 进 topN,就把它在库里的其他 chunk 一并补进结果尾部。
+        返回前做同笔记补全(见 _search_once 注释)。
+
+        rewrite_fn: CRAG-lite 用的改写回调(query -> 独立检索词, 通常注入
+        Answerer.rewrite_query)。top1 rerank 分数低于 crag.min_top1_score
+        (或检索为空)时,自动改写重检一次;改写后 top1 分数更高才采纳,
+        否则保留原结果。最终仍低置信的结果会带 low_confidence=True 标记,
+        由调用方(生成 prompt / UI)决定如何"诚实告知没有相关内容"。
         """
         top_k_out = k or self.top_k_out
         # rerank 候选数: 配置优先, 至少比输出多 2 条供淘汰
@@ -141,13 +151,68 @@ class Retriever:
         if cached and time.time() - cached[0] < self._cache_ttl:
             return [dict(r) for r in cached[1]]
 
+        results, top_score = self._search_once(query, top_k_in, top_k_out)
+
+        # ── CRAG-lite: 质量自评 → 改写重检一次 ──
+        low_conf = (not results
+                    or (top_score is not None and top_score < self.crag_min_score))
+        if low_conf and self.crag_enabled and rewrite_fn is not None:
+            try:
+                rewritten = rewrite_fn(query)
+            except Exception as e:
+                logger.warning(f"CRAG 改写回调失败,按原结果返回: {e}")
+                rewritten = ""
+            if rewritten and rewritten != query:
+                alt, alt_score = self._search_once(
+                    rewritten, top_k_in, top_k_out)
+                better = (alt and alt_score is not None
+                          and (top_score is None or alt_score > top_score))
+                if better:
+                    logger.info(
+                        f"CRAG-lite: 低置信({top_score})触发改写重检并采纳: "
+                        f"{query!r} -> {rewritten!r} (top1 {alt_score})")
+                    results, top_score = alt, alt_score
+                else:
+                    logger.info(
+                        f"CRAG-lite: 低置信触发改写重检,无更优结果: "
+                        f"{query!r} -> {rewritten!r}")
+                if results:
+                    results[0]["crag_rewritten"] = rewritten
+            low_conf = (not results
+                        or (top_score is not None
+                            and top_score < self.crag_min_score))
+        if low_conf:
+            for r in results:
+                r["low_confidence"] = True
+
+        # 缓存(超上限时清空最旧一半,简化策略)
+        if len(self._search_cache) >= self._cache_max:
+            stale = sorted(self._search_cache.items(),
+                           key=lambda x: x[1][0])[: self._cache_max // 2]
+            for kk, _ in stale:
+                self._search_cache.pop(kk, None)
+        self._search_cache[cache_key] = (time.time(), results)
+        return results
+
+    def _search_once(self, query: str, top_k_in: int,
+                     top_k_out: int) -> tuple[list[dict], float | None]:
+        """单次检索链路: 编码 → 向量召回 → hybrid 融合 → rerank → 同笔记补全。
+
+        返回 (results, top1 分数)。top1 分数为 None 表示 rerank 不可用
+        (降级为向量原序),此时 CRAG 自评不生效。
+
+        同笔记补全: rerank 只用片段前 160 字符打分,
+        配方/做法类笔记的用量常在图 OCR chunk 里(开头是 OCR 噪声,打分极低),
+        会被挤出 topN 导致 LLM 看不到关键数字。因此只要某笔记有一个
+        chunk 进 topN,就把它在候选里的其他 chunk 一并补进结果尾部。
+        """
         # 1) 编码 query
         qvec = self.embedder.encode([query])[0]
         # 2) 向量检索
         tbl = self._get_table()
         hits = tbl.search(qvec).limit(top_k_in).to_list()
         if not hits:
-            return []
+            return [], None
 
         # 2.5) hybrid: 与 BM25 结果做 RRF 融合(关键词精确命中常在 OCR 噪声 chunk
         #      里被向量检索埋掉;失败/不可用一律退回纯向量,不影响检索)
@@ -179,15 +244,8 @@ class Retriever:
                 "url": self._note_url(hit["note_id"]),
             })
         results = self._complete_note_chunks(hits, results)
-
-        # 缓存(超上限时清空最旧一半,简化策略)
-        if len(self._search_cache) >= self._cache_max:
-            stale = sorted(self._search_cache.items(),
-                           key=lambda x: x[1][0])[: self._cache_max // 2]
-            for kk, _ in stale:
-                self._search_cache.pop(kk, None)
-        self._search_cache[cache_key] = (time.time(), results)
-        return results
+        top_score = results[0]["score"] if results else None
+        return results, top_score
 
     def _note_url(self, note_id: str) -> str:
         """查笔记 url,db 不可用时留空(不影响检索)。"""
@@ -243,7 +301,14 @@ class Retriever:
         try:
             model = self._ensure_reranker()
             pairs = [[query, c] for c in candidates]
-            raw = model.compute_score(pairs)
+            try:
+                # normalize=True 过 sigmoid → [0,1] 分数。本地 base 模型实测
+                # (26 条评测集标定): 正例 top1 全部 >0.97, 负例最高 ~0.64,
+                # CRAG 阈值 0.75 正好落在分离边界。旧版 FlagEmbedding 无此
+                # 参数时退回原始 logits(仅影响 score 展示与 CRAG 自评,排序不变)
+                raw = model.compute_score(pairs, normalize=True)
+            except TypeError:
+                raw = model.compute_score(pairs)
             if isinstance(raw, float):  # 单条
                 return [raw]
             return [float(x) for x in raw]
