@@ -116,6 +116,26 @@ Windows 下也可双击 [`scripts/run.bat`](scripts/run.bat)。
 | `python -m xhs_rag.cli ask "问题"` | 命令行问答：检索 + LLM 带引用回答（`-k` 控制片段数） |
 | `python -m xhs_rag.cli mcp` | 启动 MCP server（stdio，供 WorkBuddy 等 AI 客户端接入收藏夹问答） |
 
+## 评测（RAG 全链路可复现指标）
+
+三套离线评测脚本（项目 venv 运行，评测集在 `data/eval/`，含个人 note_id 已 gitignore）：
+
+| 脚本 | 测什么 | 指标 |
+|---|---|---|
+| `scripts/eval_retrieval.py` | 检索质量（dense / hybrid / hybrid+rerank 三模式对比） | Recall@5 / MRR@10 / nDCG@5 |
+| `scripts/eval_answers.py` | 回答质量（LLM-as-judge 三维） | faithfulness / relevance / citation |
+| `scripts/eval_ragas.py` | 生成端 RAGAS 四指标（自实现，零重依赖，不装官方 ragas） | faithfulness / answer_relevancy / context_precision / context_recall |
+
+```bash
+python scripts/eval_retrieval.py --mode all      # 检索三模式对比
+python scripts/eval_ragas.py --n 6 --verbose     # RAGAS 四指标（--out 存明细）
+```
+
+RAGAS 指标按论文口径自实现：faithfulness=有依据原子陈述占比、answer_relevancy=
+反向生成问题与原 query 的 embedding 余弦均值、context_precision=片段判决的
+Average Precision、context_recall=标准答案逐句可归因占比。评测集 ground_truth
+依据笔记原文人工标注。
+
 ## MCP 接入（M9）
 
 把收藏 RAG 的 `search` / `ask` / `stats` 暴露为 MCP 工具，**AI 客户端无需开浏览器即可直问你的收藏库**。
