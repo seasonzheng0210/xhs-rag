@@ -37,6 +37,10 @@ index = [
 #   模型文件（bge-m3 / bge-reranker-v2-m3）在 data/models/ 随数据迁移，不属 pip 管。
 # M6 起：Web UI（标准库 http.server 实现，零额外依赖）
 serve = []
+# M10 起：Agent 层（LangGraph StateGraph 编排；LLM function calling 仍走 requests）
+agent = [
+    "langgraph>=1.0",
+]
 
 [project.scripts]
 xhs = "xhs_rag.cli:main"
