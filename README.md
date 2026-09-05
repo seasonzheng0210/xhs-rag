@@ -114,6 +114,7 @@ Windows 下也可双击 [`scripts/run.bat`](scripts/run.bat)。
 | `python -m xhs_rag.cli setup` | **一键建库**：登录检查（失效自动弹扫码）→ 全流水线 →（`--serve` 连 Web UI） |
 | `python -m xhs_rag.cli serve` | 启动 Web UI（检索 + 问答） |
 | `python -m xhs_rag.cli ask "问题"` | 命令行问答：检索 + LLM 带引用回答（`-k` 控制片段数） |
+| `python -m xhs_rag.cli agent "问题"` | **Agent 模式**：LLM 自主多步调工具（search / ask / read_note / stats）后作答，适合对比 / 清单 / 多主题汇总类问题（`--max-steps` 控制步数上限） |
 | `python -m xhs_rag.cli mcp` | 启动 MCP server（stdio，供 WorkBuddy 等 AI 客户端接入收藏夹问答） |
 
 ## 评测（RAG 全链路可复现指标）

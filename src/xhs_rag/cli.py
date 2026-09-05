@@ -399,6 +399,27 @@ def cmd_index(cfg: Config, force: bool = False, limit: int | None = None) -> int
     return 0
 
 
+def cmd_agent(cfg: Config, query: str, max_steps: int = 8) -> int:
+    """M10：Agent 模式 —— LLM 决策循环，自主多步调工具后作答。"""
+    from .agent import RAGAgent
+    from .qa.answer import Answerer
+
+    cfg.ensure_dirs("paths.data_dir", "paths.db")
+    ans = Answerer(cfg)
+    ok, why = ans.available()
+    if not ok:
+        logger.error(f"Agent 需要 LLM：{why}")
+        return 1
+    print(f"\n『{query}』 Agent 决策循环（max_steps={max_steps}）:\n")
+    agent = RAGAgent(cfg, verbose=True, max_steps=max_steps)
+    result = agent.run(query)
+    print(f"\n{'=' * 60}")
+    print(f"（{result['steps']} 步工具调用 / {result['secs']}s"
+          + ("，触发步数上限" if result.get("hit_limit") else "") + "）\n")
+    print(result["answer"])
+    return 0
+
+
 def cmd_search(cfg: Config, query: str, k: int = 5) -> int:
     """M5：语义检索（本地 embedding + rerank）。"""
     from .index.retriever import Retriever
@@ -594,6 +615,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("serve", help="启动 Web UI（M6，手机可访问）")
     sub.add_parser("mcp", help="启动 MCP server（stdio，供 WorkBuddy 等 AI 客户端接入收藏夹问答）")
 
+    p_agent = sub.add_parser("agent", help="Agent 模式（M10）：LLM 自主多步调工具后作答，适合对比/清单/多主题问题")
+    p_agent.add_argument("query", help="问题")
+    p_agent.add_argument("--max-steps", type=int, default=8, help="工具调用步数上限")
+
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
     _setup(cfg, "DEBUG" if args.verbose else "INFO")
@@ -621,6 +646,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_search(cfg, args.query, k=args.k)
     if args.cmd == "ask":
         return cmd_ask(cfg, args.query, k=args.k)
+    if args.cmd == "agent":
+        return cmd_agent(cfg, args.query, max_steps=args.max_steps)
     if args.cmd == "sync":
         return cmd_sync(cfg, headless=args.headless,
                         max_pages=args.max_pages, skip_media=args.skip_media)
