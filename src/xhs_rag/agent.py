@@ -49,7 +49,9 @@ AGENT_SYSTEM = """你是「收藏夹 RAG」的智能体，回答用户关于他�
 3. 已有足够信息就停止调工具，给最终回答——不要为用工具而用工具。
 4. 最终回答用中文，先结论后展开，依据工具返回内容并标注来源笔记标题，不编造。
 5. 收藏夹确实没有的内容，如实说明，不要脑补。
-6. 调用工具必须走 function calling 工具调用接口，禁止把工具调用写成文字内容。"""
+6. 调用工具必须走 function calling 工具调用接口，禁止把工具调用写成文字内容。
+7. 收藏夹里确实没有相关内容时，直接说明「收藏夹里没有找到相关内容」即可，不要编造内容，
+   也不要推荐外部网站/链接/教程渠道（搜索词与网址同理，一律不许编）。"""
 
 # OpenAI function calling 工具声明（与 RAGAgent._exec_tool 分发一一对应）
 TOOLS_SPEC = [
@@ -90,9 +92,12 @@ class AgentState(TypedDict):
 
 
 class RAGAgent:
-    # 弱模型自愈:把 text 里的伪工具调用 search("词", 1) 解析回结构化调用
+    # 弱模型自愈:把 content 里的伪工具调用文本解析回结构化调用
     # (glm-4-flash 实测:单工具时走 function calling,4 个工具时偶发退化为纯文本)
+    # 覆盖两种退化形态: fn("a", 1) 括号式 / fn "a" 引号式(无括号,如 ask "问题")
     _PSEUDO_RE = re.compile(r"^\s*([a-zA-Z_]\w*)\((.*)\)\s*;?\s*$", re.S)
+    _PSEUDO_QUOTED_RE = re.compile(
+        r'^\s*([a-zA-Z_]\w*)\s*[:：]?\s*["\']([^"\']{1,200})["\']\s*;?\s*$', re.S)
     _POSITIONAL = {"search": ["query", "k"], "ask": ["query"],
                    "read_note": ["note_id"], "stats": []}
 
@@ -204,16 +209,23 @@ class RAGAgent:
     def _parse_pseudo_call(self, text: str) -> dict | None:
         """把 content 里的伪工具调用文本解析成 {name, args}。不是伪调用返回 None。"""
         m = self._PSEUDO_RE.match(text.strip())
-        if not m or m.group(1) not in self._POSITIONAL:
+        argstr: str | None = None
+        if m and m.group(1) in self._POSITIONAL:
+            fn, argstr = m.group(1), m.group(2).strip()
+        else:
+            q = self._PSEUDO_QUOTED_RE.match(text.strip())
+            if q and q.group(1) in self._POSITIONAL:
+                fn, argstr = q.group(1), q.group(2)
+        if argstr is None:
             return None
-        fn, argstr = m.group(1), m.group(2).strip()
         if not argstr:
             return {"name": fn, "args": {}}
         try:
             import ast
             vals = ast.literal_eval(f"[{argstr}]")
         except Exception:
-            return None
+            # 引号式退化形态: argstr 是裸字符串(引号已被分组吃掉)
+            vals = [argstr]
         if not isinstance(vals, list) or not all(
                 isinstance(v, (str, int, float, bool)) for v in vals):
             return None
