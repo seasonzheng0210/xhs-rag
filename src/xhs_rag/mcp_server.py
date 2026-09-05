@@ -120,15 +120,27 @@ def _tool_search(query: str, k: int = 5) -> str:
     }, ensure_ascii=False, indent=2)
 
 
-def _tool_ask(query: str) -> str:
+def _tool_ask(query: str, history: list[dict] | None = None) -> str:
     if not query.strip():
         return json.dumps({"error": "query 不能为空"}, ensure_ascii=False)
     ctx = _get_ctx()
     q = query.strip()
+    # 多轮: 追问式 query 先结合历史改写成独立检索词(history 由客户端传入)
+    history = [h for h in (history or [])
+               if isinstance(h, dict) and h.get("role") in ("user", "assistant")]
+    search_q = q
+    answerer0 = ctx["answerer"]
+    if history and answerer0 is not None and answerer0.needs_rewrite(q, history):
+        try:
+            search_q = answerer0.rewrite_query(q, history)
+        except Exception:
+            search_q = q
     t0 = time.time()
-    results = _enrich(ctx["retriever"].search(q))
+    results = _enrich(ctx["retriever"].search(search_q))
     out: dict = {"query": q, "search_secs": round(time.time() - t0, 1),
                  "answer": "", "model": "", "results": [_trim(r, 200) for r in results]}
+    if search_q != q:
+        out["rewritten_query"] = search_q
     if not results:
         out["answer"] = "收藏夹里没有检索到相关内容，换个问法试试。"
         return json.dumps(out, ensure_ascii=False, indent=2)
@@ -138,7 +150,7 @@ def _tool_ask(query: str) -> str:
         return json.dumps(out, ensure_ascii=False, indent=2)
     try:
         t1 = time.time()
-        out["answer"] = answerer.answer(q, results)
+        out["answer"] = answerer.answer(q, results, history or None)
         out["model"] = answerer.model
         out["llm_secs"] = round(time.time() - t1, 1)
     except Exception as e:
@@ -210,10 +222,12 @@ def main() -> int:
         except Exception as e:
             return json.dumps({"error": f"search 失败: {e}"}, ensure_ascii=False)
 
-    @mcp.tool(description="基于收藏夹做 LLM 问答：检索 + 生成带引用的回答")
-    def ask(query: str) -> str:
+    @mcp.tool(description="基于收藏夹做 LLM 问答：检索 + 生成带引用的回答。"
+                          "多轮对话时传 history=[{role,content},...]（本轮之前的对话），"
+                          "追问会被自动改写成独立检索词")
+    def ask(query: str, history: list[dict] | None = None) -> str:
         try:
-            return _tool_ask(query)
+            return _tool_ask(query, history)
         except Exception as e:
             return json.dumps({"error": f"ask 失败: {e}"}, ensure_ascii=False)
 

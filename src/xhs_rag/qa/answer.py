@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Iterator
 
@@ -38,6 +39,14 @@ SYSTEM_PROMPT = """你是「收藏夹 RAG」的问答助手。用户会把自己
 5. 片段之间若有冲突，如实指出分歧并分别标注来源。
 6. 片段中出现的具体数字——用量、时间、温度、数量、比例等——必须原样保留，禁止省略或概括。例如片段写「加2勺生抽+1勺蚝油」，回答也必须写「2勺生抽、1勺蚝油」，不能只写「生抽、蚝油」。
 7. 涉及调料的具体用量必须写明，不可省略成「适量」。"""
+
+# 多轮改写用的 system prompt(独立于问答 prompt,只做检索词改写)
+REWRITE_PROMPT = """你在多轮对话里改写检索词。给出对话历史和用户的最新问题,
+把它改写成一句**不依赖对话历史就能独立理解**的完整检索查询:
+- 补全指代(「第二个」「那个汤」「它怎么做」→ 指明的具体对象)
+- 补全省略的主语/宾语,保留用户的原始意图和关键词
+- 只输出改写后的查询词本身,一行,不要解释、不要加引号
+- 如果最新问题本身已经独立完整,原样输出"""
 
 
 class LLMUnavailable(Exception):
@@ -79,6 +88,49 @@ class Answerer:
             return False, f"未配置 {self.api_key_env}（填到项目根目录的 .env 里）"
         return True, ""
 
+    # ── 多轮对话 ────────────────────────────────────────────
+    # 指代/省略启发式: 命中任一即视为追问,需要结合历史改写检索词
+    _FOLLOWUP_RE = re.compile(
+        r"^(第[一二三四五六七八九十\d]+个?|那个?|这个|它|他们|上面的?|"
+        r"还有(吗|呢|别的)?|换个?|再来|详细说说|展开|为什么|怎么做|多少钱|"
+        r"用量|步骤|做法呢?|呢$|吗$)"
+    )
+
+    @classmethod
+    def needs_rewrite(cls, query: str, history: list[dict] | None) -> bool:
+        """判断是否需要结合历史改写检索词。
+
+        规则: 没有 history 一律不改;query 已经够长且具体(>=12 字且不含
+        指代词)也不改,省一次 LLM 调用。
+        """
+        if not history:
+            return False
+        q = query.strip()
+        if len(q) >= 12 and not cls._FOLLOWUP_RE.search(q):
+            return False
+        return True
+
+    def rewrite_query(self, query: str, history: list[dict]) -> str:
+        """结合对话历史把追问改写成独立检索词。失败时原样返回(不影响主流程)。"""
+        msgs = [{"role": "system", "content": REWRITE_PROMPT}]
+        for h in history[-4:]:  # 最多带 2 轮(4 条),改写不需要更长
+            msgs.append({"role": h.get("role", "user"),
+                         "content": (h.get("content") or "")[:400]})
+        msgs.append({"role": "user", "content": query})
+        try:
+            resp = requests.post(
+                self.base_url.rstrip("/") + "/chat/completions",
+                json=self._payload(msgs, stream=False)
+                | {"max_tokens": 100},
+                headers=self._headers(), timeout=(10, 20))
+            resp.raise_for_status()
+            out = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+            out = out.strip("\"'「」"" ").splitlines()[0].strip()
+            return out or query
+        except Exception as e:
+            logger.warning(f"query 改写失败,用原始 query 检索: {e}")
+            return query
+
     def _payload(self, messages: list[dict], stream: bool) -> dict:
         body = {
             "model": self.model,
@@ -99,8 +151,13 @@ class Answerer:
         return body
 
     # ── 构造上下文 ──────────────────────────────────────────
-    def build_messages(self, query: str, results: list[dict]) -> list[dict]:
-        """把检索结果组装成带编号的上下文。"""
+    def build_messages(self, query: str, results: list[dict],
+                       history: list[dict] | None = None) -> list[dict]:
+        """把检索结果组装成带编号的上下文。
+
+        history: 多轮对话历史 [{role: user|assistant, content: str}],
+        注入在系统提示与当前问题之间(assistant 回答截断 300 字防膨胀)。
+        """
         parts = []
         for i, r in enumerate(results, 1):
             kind = "视频" if r.get("note_type") == "video" else "图文"
@@ -108,12 +165,17 @@ class Answerer:
             text = (r.get("text") or "")[: self.max_ctx_chars]
             parts.append(f"[{i}] 《{r.get('title', '无标题')}》{kind}{section}\n{text}")
         context = "\n\n".join(parts)
-        return [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",
-             "content": f"以下是我收藏夹里的相关片段：\n\n{context}\n\n"
-                        f"问题：{query}\n\n请按规则回答。"},
-        ]
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for h in (history or [])[-8:]:  # 最多 4 轮
+            content = (h.get("content") or "").strip()
+            if content:
+                messages.append({"role": h.get("role", "user"),
+                                 "content": content[:300]
+                                 if h.get("role") == "assistant" else content})
+        messages.append({"role": "user",
+                         "content": f"以下是我收藏夹里的相关片段：\n\n{context}\n\n"
+                                    f"问题：{query}\n\n请按规则回答。"})
+        return messages
 
     # ── 请求 ────────────────────────────────────────────────
     def _headers(self) -> dict:
@@ -124,14 +186,19 @@ class Answerer:
                 h["Authorization"] = f"Bearer {key}"
         return h
 
-    def stream(self, query: str, results: list[dict]) -> Iterator[str]:
-        """流式产出回答文本。不可用或出错抛 LLMUnavailable。"""
+    def stream(self, query: str, results: list[dict],
+               history: list[dict] | None = None) -> Iterator[str]:
+        """流式产出回答文本。不可用或出错抛 LLMUnavailable。
+
+        history: 多轮对话历史,见 build_messages。
+        """
         ok, why = self.available()
         if not ok:
             raise LLMUnavailable(why)
 
         url = self.base_url.rstrip("/") + "/chat/completions"
-        body = self._payload(self.build_messages(query, results), stream=True)
+        body = self._payload(
+            self.build_messages(query, results, history), stream=True)
         try:
             resp = requests.post(url, json=body, headers=self._headers(),
                                  stream=True, timeout=(10, self.timeout))
@@ -160,9 +227,10 @@ class Answerer:
             if text:
                 yield text
 
-    def answer(self, query: str, results: list[dict]) -> str:
+    def answer(self, query: str, results: list[dict],
+               history: list[dict] | None = None) -> str:
         """一次性返回完整回答（CLI 用）。"""
-        return "".join(self.stream(query, results))
+        return "".join(self.stream(query, results, history))
 
 
 def pretty_stream(query: str, results: list[dict], answerer: Answerer,

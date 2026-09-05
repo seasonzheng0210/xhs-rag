@@ -120,7 +120,10 @@ async function go(){
   const t0=Date.now();
   try{
     // 一次性流式接口：先推检索结果，再逐字推 LLM 回答
-    const resp=await fetch('/api/answer?q='+encodeURIComponent(q));
+    // 多轮: sid 存 localStorage,同会话追问服务端自动结合历史改写检索词
+    if(!localStorage.xhsSid)localStorage.xhsSid=crypto.randomUUID();
+    const resp=await fetch('/api/answer?q='+encodeURIComponent(q)
+      +'&sid='+encodeURIComponent(localStorage.xhsSid));
     const reader=resp.body.getReader(),dec=new TextDecoder();
     let buf='';
     for(;;){
@@ -133,6 +136,9 @@ async function go(){
         let d;try{d=JSON.parse(ln.slice(6))}catch(e){continue}
         if(d.type==='meta'){
           $('#status').textContent='检索到 '+d.results.length+' 条，正在生成回答…';
+          if(d.rewritten)$('#status').innerHTML=
+            '<span class="spin"></span>按「'+d.rewritten+'」检索到 '+
+            d.results.length+' 条，正在生成回答…';
           render(d.results);
         }else if(d.type==='delta'){
           let b=$('#answer-box .body');
@@ -267,6 +273,11 @@ class Handler(BaseHTTPRequestHandler):
     db_path: str = ""
     answerer = None  # qa.Answerer，未配置则 None
     debug: bool = False  # 调试模式: 错误响应携带完整 traceback, 前端可查看/复制/跳 WorkBuddy
+    # 多轮对话会话存储: sid -> [{role, content}] (扁平 messages, 最新在后)
+    # 内存态, 重启即清空; 每会话最多保留 6 轮, 30 分钟无活动整段过期
+    sessions: dict = {}
+    SESSION_TTL = 1800
+    SESSION_MAX_ROUNDS = 6
 
     def _db_conn(self):
         """每请求新建 sqlite 连接(sqlite 连接不能跨线程)。"""
@@ -429,18 +440,40 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_answer(self, url):
         """检索 + LLM 问答，SSE 流式：
         先推 meta(检索结果) → 逐字推 delta(回答) → done(耗时)。
-        LLM 不可用时只推 notice，检索结果照常返回。"""
+        LLM 不可用时只推 notice，检索结果照常返回。
+        多轮: 带 sid 时取会话历史; 追问式 query 先经 LLM 改写成独立检索词。"""
         q = (parse_qs(url.query).get("q") or [""])[0].strip()
+        sid = (parse_qs(url.query).get("sid") or [""])[0].strip()
         if not q:
             self._json({"error": "缺少 q 参数"}, 400)
             return
+
+        # ── 多轮: 取会话历史(过期整段清理), 判断是否需要改写检索词 ──
+        history = self.sessions.get(sid, []) if sid else []
+        if history and time.time() - history[0].get("_ts", 0) > self.SESSION_TTL:
+            self.sessions.pop(sid, None)
+            history = []
+        history = [h for h in history if h.get("role") in ("user", "assistant")]
+
+        rewritten = ""
+        if history and self.answerer is not None:
+            try:
+                if self.answerer.needs_rewrite(q, history):
+                    rewritten = self.answerer.rewrite_query(q, history)
+            except Exception as e:
+                logger.warning(f"改写环节异常,按原 query 检索: {e}")
+
+        search_q = rewritten or q  # 检索用改写词; 生成仍用原始 q(历史已注入)
         self._sse_head()
         try:
             t0 = time.time()
-            results = self._enrich(self.retriever.search(q))
+            results = self._enrich(self.retriever.search(search_q))
             search_secs = round(time.time() - t0, 1)
-            self._sse({"type": "meta", "q": q, "secs": search_secs,
-                       "results": results})
+            meta = {"type": "meta", "q": q, "secs": search_secs,
+                    "results": results}
+            if rewritten and rewritten != q:
+                meta["rewritten"] = rewritten
+            self._sse(meta)
             if not results:
                 self._sse({"type": "done", "search_secs": search_secs,
                            "llm_secs": 0})
@@ -463,12 +496,24 @@ class Handler(BaseHTTPRequestHandler):
 
             t1 = time.time()
             first = True
-            for piece in answerer.stream(q, results):
+            answer_buf: list[str] = []
+            for piece in answerer.stream(q, results, history or None):
+                answer_buf.append(piece)
                 evt = {"type": "delta", "text": piece}
                 if first:  # 首块带上模型名，用于 UI 角标
                     evt["model"] = answerer.model
                     first = False
                 self._sse(evt)
+            # ── 多轮: 回答完成, 写回会话(最多保留 N 轮) ──
+            if sid:
+                sess = self.sessions.setdefault(sid, [])
+                sess.append({"role": "user", "content": q, "_ts": time.time()})
+                sess.append({"role": "assistant",
+                             "content": "".join(answer_buf)})
+                # 截断到最近 N 轮(user+assistant 成对)
+                keep = self.SESSION_MAX_ROUNDS * 2
+                if len(sess) > keep:
+                    del sess[:-keep]
             self._sse({"type": "done", "search_secs": search_secs,
                        "llm_secs": round(time.time() - t1, 1)})
         except Exception as e:  # 含 LLMUnavailable 与客户端断开
