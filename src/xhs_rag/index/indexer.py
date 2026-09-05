@@ -42,6 +42,51 @@ class Indexer:
         except Exception:
             return 0
 
+    def prune(self) -> int:
+        """索引一致性清理: 移除「vault 已删除 / SQLite 软删除」笔记的残留 chunk。
+
+        索引以 vault/*.md 为输入,但收藏夹是会变动的:
+          - 用户在 Obsidian 里删了 md / 作者删了原帖导致 cleanup
+          - 用户在小红书取消收藏(soft delete, notes.deleted_at)
+        这两种情况下 chunk 仍留在 LanceDB 里被检索到 —— 已失效的内容不该
+        出现在答案里。每次增量索引前自动执行;全量重建(--force)不需要。
+
+        注: 全表拉取统计 note_id 在当前语料规模(百级 chunk)毫秒级;
+        语料到 ann_min_rows 量级时这里也要换谓词查询,与 ANN 阈值一起调。
+        """
+        db = self._connect()
+        if self.table_name not in db.table_names():
+            return 0
+        tbl = db.open_table(self.table_name)
+        indexed = set(tbl.to_pandas()["note_id"].unique())
+
+        alive = {md.stem for md in self.vault.glob("*.md")}
+        stale = indexed - alive
+
+        soft_deleted: set[str] = set()
+        db_path = self.cfg.path("paths.data_dir") / "xhs.db"
+        if db_path.exists():
+            import sqlite3
+
+            conn = sqlite3.connect(str(db_path))
+            try:
+                rows = conn.execute(
+                    "SELECT note_id FROM notes WHERE deleted_at IS NOT NULL"
+                ).fetchall()
+                soft_deleted = {r[0] for r in rows}
+            finally:
+                conn.close()
+        stale |= indexed & soft_deleted
+
+        if not stale:
+            return 0
+        ids = ",".join(f"'{n}'" for n in sorted(stale))
+        tbl.delete(f"note_id IN ({ids})")
+        logger.info(
+            f"索引一致性清理: 移除 {len(stale)} 篇失效笔记的 chunk "
+            f"(样例 {sorted(stale)[:3]})")
+        return len(stale)
+
     def run(self, force: bool = False, limit: int | None = None) -> dict:
         mds = sorted(self.vault.glob("*.md"))
         if limit:
@@ -55,9 +100,15 @@ class Indexer:
         # 已索引的 note_id(增量跳过)
         # 注意:不能用 tbl.to_batches()——lancedb 0.37 无此方法,异常被吞会导致全量重编码
         indexed: set[str] = set()
+        pruned = 0
         try:
             tbl = db.open_table(self.table_name)
             indexed = set(tbl.to_pandas()["note_id"].unique())
+            if not force:
+                # 增量路径先清理失效笔记(软删除/已删除),全量重建不需要
+                pruned = self.prune()
+                if pruned:
+                    indexed -= set()  # stale 已从表中删除,下方按 md 判断不受影响
         except Exception:
             pass  # 表不存在,全新索引
 
@@ -69,7 +120,8 @@ class Indexer:
         logger.info(f"待编码 chunk: {len(chunks)}")
 
         if not chunks:
-            return {"md": len(mds), "chunks": 0, "skip_md": len(indexed)}
+            return {"md": len(mds), "chunks": 0, "skip_md": len(indexed),
+                    "pruned": pruned}
 
         # 分批编码(避免一次吃太多内存)
         batch_size = int(self.cfg.get("embedding.local.batch_size", 8))
@@ -119,5 +171,8 @@ class Indexer:
                 f"语料 {len(rows)} 行 < ann_min_rows,保持 flat 精确扫描"
                 "(小表 ANN 会饿死召回)")
 
-        logger.success(f"M5 索引完成: {len(mds)} 篇, {len(rows)} chunks")
-        return {"md": len(mds), "chunks": len(rows), "skip_md": len(indexed)}
+        logger.success(
+            f"M5 索引完成: {len(mds)} 篇, {len(rows)} chunks"
+            + (f", 清理失效 {pruned} 篇" if pruned else ""))
+        return {"md": len(mds), "chunks": len(rows), "skip_md": len(indexed),
+                "pruned": pruned}
