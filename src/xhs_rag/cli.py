@@ -100,14 +100,20 @@ def cmd_login(cfg: Config, timeout: int | None = None) -> int:
     timeout = timeout or int(cfg.get("auth.qrcode_timeout", 180))
     png = cfg.path("auth.qrcode_output") if cfg.get("auth.qrcode_output") else Path("data/auth/qrcode.png")
 
-    with BrowserSession(cfg, headless=bool(cfg.get("auth.headless", False))) as ctx:
+    session_bs = BrowserSession(cfg, headless=bool(cfg.get("auth.headless", False)))
+    with session_bs as ctx:
         result = qrcode_login(ctx, timeout=timeout, png_path=png)
 
         if not result.ok:
+            # ★ 事务式写回（2026-09-06）：登录失败/超时 = 中间态 cookie，
+            #   绝不允许 __exit__ 把它写回覆盖旧登录态（曾致假登录视图）。
+            #   旧 storage_state.json 保留，下次 login 还能正常注入重试。
+            session_bs.allow_state_commit = False
             logger.error(f"登录未完成：{result.reason}")
+            logger.info("旧登录态已保留（storage_state.json 未被覆盖），可直接重试 login")
             return 1
 
-        # storage_state 由 BrowserSession.__exit__ 统一写，这里只补 user_id
+        # storage_state 由 BrowserSession.__exit__ 统一写（此时 allow_state_commit=True）
         if result.user_id:
             save_user_id(cfg, result.user_id)
             logger.info(f"user_id 已写入 config.yaml: {result.user_id}")
