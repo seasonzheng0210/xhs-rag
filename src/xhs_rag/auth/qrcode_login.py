@@ -199,16 +199,15 @@ def qrcode_login(
     deadline = time.time() + timeout
     last_dom_shot = 0.0
     DOM_REFRESH_SEC = 45      # 二维码有效期通常 3-5 分钟，定期重截避免用户扫到过期的
-    SCANNED_HINT = False
+
+    # ★ 2026-09-06 参照 MediaCrawler media_platform/xhs/login.py 重写成功判定：
+    #   login_state 检测 = web_session cookie 值变化（服务端下发新 session 即登录成功），
+    #   不做主动 goto —— 小红书登录成功后页面会自动重定向，goto 反而打断这个流程。
+    #   也不要求当场拿到 user_id（config.yaml 已有，后续流程可补）。
+    no_logged_in_session = _web_session_value(ctx)
 
     logger.info(f"等待扫码（{timeout} 秒内有效）…")
     while time.time() < deadline:
-        # cookie 是快判（本地，零成本），服务端认可是定判 —— 两者都过才算登录成功
-        if is_logged_in(ctx) and get_login_user_id(page):
-            logger.success("登录成功（服务端已认可）")
-            return LoginResult(ok=True, user_id=get_login_user_id(page) or "",
-                               qr_png=qr_png)
-
         # 扫码途中也可能被弹验证码，同样等人过掉后继续
         try:
             if looks_like_captcha(page.url):
@@ -218,6 +217,22 @@ def qrcode_login(
                 continue
         except Exception:
             pass
+
+        # ★ 成功判定（对齐 MediaCrawler.check_login_state 的 cookie 信号）：
+        #   web_session 值 ≠ 登录前快照 = 服务端已下发新 session = 扫码登录成功。
+        #   注意不能用 is_logged_in(ctx)：restore_cookies 注入旧 cookie 后它恒为 True。
+        current_ws = _web_session_value(ctx)
+        if current_ws and current_ws != no_logged_in_session:
+            logger.success("登录成功（服务端已下发新的 web_session）")
+            # 等页面自动重定向完成（MediaCrawler 同样 sleep 5s），让登录态充分落盘
+            try:
+                page.wait_for_timeout(5000)
+            except Exception:
+                pass
+            uid = get_login_user_id(page) or ""
+            if not uid:
+                logger.info("页面重定向未完成，user_id 留待后续流程补齐（config.yaml 已有）")
+            return LoginResult(ok=True, user_id=uid, qr_png=qr_png)
 
         # 接口嗅探优先：拿到二维码内容就能本地重绘，还能终端打印
         if captured.get("url") and captured["url"] != shown_url:
@@ -311,6 +326,22 @@ def is_logged_in(ctx: BrowserContext) -> bool:
         return any(c["name"] == SESSION_COOKIE for c in ctx.cookies())
     except Exception:
         return False
+
+
+def _web_session_value(ctx: BrowserContext) -> str | None:
+    """取当前 context 里 web_session cookie 的值；没有则 None。
+
+    ★ 2026-09-06 新增：区分「旧登录态」与「扫码后新登录态」的唯一可靠本地信号。
+      restore_cookies 会让 is_logged_in 恒 True（旧 cookie 在），必须比**值**：
+      扫码确认后服务端下发新 web_session，值会变 —— 变了 = 登录真的完成了。
+    """
+    try:
+        for c in ctx.cookies():
+            if c["name"] == SESSION_COOKIE:
+                return c.get("value")
+    except Exception:
+        pass
+    return None
 
 
 USER_ID_RE = re.compile(r"/user/profile/([0-9a-fA-F]{24})")
