@@ -574,6 +574,60 @@ def cmd_serve(cfg: Config) -> int:
     return run_server(cfg)
 
 
+# ── memory（M11 长期记忆）────────────────────────────────
+def cmd_memory(cfg: Config, action: str, max_blocks: int = 6,
+               yes: bool = False) -> int:
+    """digest/show/clear 三动作。db_path 独立连接(线程安全)。"""
+    db_path = str(cfg.path("paths.db"))
+    if action == "digest":
+        from .memory import counts, run_digest
+        from .qa.answer import Answerer
+
+        answerer = Answerer(cfg)
+        out = run_digest(db_path, answerer, max_blocks=max_blocks)
+        if out.get("error"):
+            print(f"[FAIL] digest 无法执行: {out['error']}")
+            return 1
+        print(f"处理对话块: {out.get('processed_blocks', 0)}"
+              f" / 轮次: {out.get('rounds', 0)}"
+              f" / 新摘要: {out.get('summaries', 0)}"
+              f" / 画像候选: {out.get('profiles', 0)}"
+              f" / 失败块: {out.get('errors', 0)}")
+        c = counts(db_path)
+        print(f"当前: 待消化 {c['pending_rounds']} 轮"
+              f" / 摘要 {c['digests']} 条 / 画像 {c['profiles']} 条")
+        return 0
+    if action == "show":
+        from .memory import counts, digests, profiles
+
+        c = counts(db_path)
+        print(f"===== 记忆状态: 待消化 {c['pending_rounds']} 轮"
+              f" / 摘要 {c['digests']} / 画像 {c['profiles']} =====")
+        ds = digests(db_path, 10)
+        if ds:
+            print("\n-- 对话摘要(最近 10) --")
+            for d in ds:
+                print(f"[{d['created_at']}] ({d['span']}轮) {d['summary']}")
+        ps = profiles(db_path, 30)
+        if ps:
+            print("\n-- 用户画像(hit 降序) --")
+            for p in ps:
+                print(f"[x{p['hit_count']}] {p['content']}"
+                      f"{'  ← ' + p['source'] if p.get('source') else ''}")
+        return 0
+    if action == "clear":
+        if not yes:
+            print("清空全部记忆(摘要+画像+对话流水)不可撤销。")
+            print("确认请执行: python -m xhs_rag.cli memory clear --yes")
+            return 1
+        from .memory import clear as mem_clear
+
+        print(mem_clear(db_path))
+        return 0
+    print(f"未知 memory 动作: {action}")
+    return 1
+
+
 # ── main ──────────────────────────────────────────────────
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="xhs", description="小红书收藏夹 RAG")
@@ -625,6 +679,14 @@ def main(argv: list[str] | None = None) -> int:
     p_agent.add_argument("query", help="问题")
     p_agent.add_argument("--max-steps", type=int, default=8, help="工具调用步数上限")
 
+    p_mem = sub.add_parser("memory", help="长期记忆（M11）：digest 对话 / 查看 / 清空")
+    p_mem_sub = p_mem.add_subparsers(dest="mem_action", required=True)
+    pm_d = p_mem_sub.add_parser("digest", help="消化未处理对话 → 摘要+用户画像")
+    pm_d.add_argument("--max-blocks", type=int, default=6, help="本次最多处理块数")
+    p_mem_sub.add_parser("show", help="查看已存摘要与画像")
+    pm_c = p_mem_sub.add_parser("clear", help="清空全部记忆（不可撤销）")
+    pm_c.add_argument("--yes", action="store_true", help="跳过确认直接清空")
+
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
     _setup(cfg, "DEBUG" if args.verbose else "INFO")
@@ -663,6 +725,11 @@ def main(argv: list[str] | None = None) -> int:
                          skip_media=args.skip_media, serve=args.serve)
     if args.cmd == "serve":
         return cmd_serve(cfg)
+    if args.cmd == "memory":
+        return cmd_memory(cfg, args.mem_action,
+                          max_blocks=args.max_blocks
+                          if args.mem_action == "digest" else 6,
+                          yes=getattr(args, "yes", False))
     if args.cmd == "mcp":
         from .mcp_server import main as mcp_main
 

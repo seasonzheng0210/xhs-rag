@@ -118,3 +118,42 @@ CREATE TABLE IF NOT EXISTS eval_results (
     top1_note   TEXT,
     created_at  INTEGER
 );
+
+-- ────────────────────────────────────────────────────────────
+-- M11 长期记忆：对话原文流水（在线采集，零 LLM 成本）
+-- ────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS dialog_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         INTEGER NOT NULL,          -- 毫秒
+    session    TEXT NOT NULL DEFAULT '',  -- Web sid（CLI 无会话时为空）
+    role       TEXT NOT NULL,             -- user | assistant
+    content    TEXT NOT NULL,
+    digested   INTEGER NOT NULL DEFAULT 0 -- 是否已被 digest 消费（断点续传）
+);
+
+CREATE INDEX IF NOT EXISTS idx_dialog_pending ON dialog_log(digested, id);
+
+-- ────────────────────────────────────────────────────────────
+-- M11 长期记忆：对话摘要轨（跨会话背景，用户问过什么/关心什么/答过什么）
+-- ────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS memory_digests (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    summary    TEXT NOT NULL,
+    span       INTEGER NOT NULL DEFAULT 0,  -- 覆盖的对话轮次
+    created_at INTEGER NOT NULL
+);
+
+-- ────────────────────────────────────────────────────────────
+-- M11 长期记忆：用户画像轨（从 user 消息抽取的稳定特征，越用越懂）
+-- ────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS profile_entries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    content    TEXT NOT NULL,              -- 画像事实（归一化后作为去重依据）
+    source     TEXT,                       -- 证据：抽自哪段对话
+    hit_count  INTEGER NOT NULL DEFAULT 1,
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL,
+    active     INTEGER NOT NULL DEFAULT 1  -- 软删（记忆纠偏）
+);
+
+CREATE INDEX IF NOT EXISTS idx_profile_active ON profile_entries(active, last_seen DESC);

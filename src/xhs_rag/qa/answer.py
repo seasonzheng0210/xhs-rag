@@ -152,11 +152,15 @@ class Answerer:
 
     # ── 构造上下文 ──────────────────────────────────────────
     def build_messages(self, query: str, results: list[dict],
-                       history: list[dict] | None = None) -> list[dict]:
+                       history: list[dict] | None = None,
+                       memory_note: str = "") -> list[dict]:
         """把检索结果组装成带编号的上下文。
 
         history: 多轮对话历史 [{role: user|assistant, content: str}],
         注入在系统提示与当前问题之间(assistant 回答截断 300 字防膨胀)。
+        memory_note: M11 长期记忆的背景注记文本(内存摘要+用户画像,
+        由 memory.recent_context 生成)。以第二条 system 消息注入在
+        history 之前；文本自带"非检索片段"声明，防止被当事实来源。
         """
         parts = []
         for i, r in enumerate(results, 1):
@@ -166,6 +170,8 @@ class Answerer:
             parts.append(f"[{i}] 《{r.get('title', '无标题')}》{kind}{section}\n{text}")
         context = "\n\n".join(parts)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if memory_note:
+            messages.append({"role": "system", "content": memory_note})
         for h in (history or [])[-8:]:  # 最多 4 轮
             content = (h.get("content") or "").strip()
             if content:
@@ -187,10 +193,12 @@ class Answerer:
         return h
 
     def stream(self, query: str, results: list[dict],
-               history: list[dict] | None = None) -> Iterator[str]:
+               history: list[dict] | None = None,
+               memory_note: str = "") -> Iterator[str]:
         """流式产出回答文本。不可用或出错抛 LLMUnavailable。
 
         history: 多轮对话历史,见 build_messages。
+        memory_note: M11 长期记忆背景注记,见 build_messages。
         """
         ok, why = self.available()
         if not ok:
@@ -198,7 +206,8 @@ class Answerer:
 
         url = self.base_url.rstrip("/") + "/chat/completions"
         body = self._payload(
-            self.build_messages(query, results, history), stream=True)
+            self.build_messages(query, results, history, memory_note),
+            stream=True)
         try:
             resp = requests.post(url, json=body, headers=self._headers(),
                                  stream=True, timeout=(10, self.timeout))
@@ -228,9 +237,10 @@ class Answerer:
                 yield text
 
     def answer(self, query: str, results: list[dict],
-               history: list[dict] | None = None) -> str:
+               history: list[dict] | None = None,
+               memory_note: str = "") -> str:
         """一次性返回完整回答（CLI 用）。"""
-        return "".join(self.stream(query, results, history))
+        return "".join(self.stream(query, results, history, memory_note))
 
 
 def pretty_stream(query: str, results: list[dict], answerer: Answerer,

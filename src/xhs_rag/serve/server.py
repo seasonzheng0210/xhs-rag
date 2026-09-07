@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import socket
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -415,6 +416,18 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_answer(url)
         elif url.path == "/api/stats":
             self._json(self._stats())
+        elif url.path == "/api/memory":
+            # M11: 长期记忆状态(对话流水/摘要/画像), 只读不加工
+            try:
+                from ..memory import counts, digests, profiles
+
+                self._json({
+                    "counts": counts(self.db_path),
+                    "digests": digests(self.db_path, 5),
+                    "profiles": profiles(self.db_path, 20),
+                })
+            except Exception as e:
+                self._json({"error": f"memory: {e}"}, 500)
         elif url.path == "/api/health":
             # 健康检查: Docker healthcheck / 监控探活。不触发模型推理, 秒回。
             try:
@@ -447,6 +460,9 @@ class Handler(BaseHTTPRequestHandler):
         if not q:
             self._json({"error": "缺少 q 参数"}, 400)
             return
+        # ── M11: 用户提问原文落盘(零 LLM 成本, 离线 digest 消费) ──
+        from ..memory import log_dialog
+        log_dialog(self.db_path, "user", q, sid)
 
         # ── 多轮: 取会话历史(过期整段清理), 判断是否需要改写检索词 ──
         history = self.sessions.get(sid, []) if sid else []
@@ -502,7 +518,16 @@ class Handler(BaseHTTPRequestHandler):
             t1 = time.time()
             first = True
             answer_buf: list[str] = []
-            for piece in answerer.stream(q, results, history or None):
+            # ── M11: 注入长期记忆背景注记(摘要+画像, 空则不影响) ──
+            memory_note = ""
+            if self.db_path:
+                try:
+                    from ..memory import recent_context
+                    memory_note = recent_context(self.db_path)
+                except Exception as e:
+                    logger.warning(f"记忆背景注记读取失败(忽略): {e}")
+            for piece in answerer.stream(q, results, history or None,
+                                         memory_note):
                 answer_buf.append(piece)
                 evt = {"type": "delta", "text": piece}
                 if first:  # 首块带上模型名，用于 UI 角标
@@ -519,6 +544,8 @@ class Handler(BaseHTTPRequestHandler):
                 keep = self.SESSION_MAX_ROUNDS * 2
                 if len(sess) > keep:
                     del sess[:-keep]
+            # ── M11: 回答原文落盘(digest 消费), 失败不影响主流程 ──
+            log_dialog(self.db_path, "assistant", "".join(answer_buf), sid)
             self._sse({"type": "done", "search_secs": search_secs,
                        "llm_secs": round(time.time() - t1, 1)})
         except Exception as e:  # 含 LLMUnavailable 与客户端断开
@@ -592,12 +619,27 @@ def _build_answerer(cfg: Config):
         return None
 
 
+def _startup_digest(cfg) -> None:
+    """后台线程: 启动时消化一次未处理的对话记忆(digest)。
+
+    失败/无 LLM 都只记日志, 不影响 serve 主流程。
+    """
+    try:
+        from ..memory import run_digest
+
+        out = run_digest(str(cfg.path("paths.db")), Handler.answerer,
+                         verbose=False)
+        if out.get("processed_blocks"):
+            logger.info(f"启动记忆消化完成: {out}")
+    except Exception as e:
+        logger.warning(f"启动记忆消化失败(不影响服务): {e}")
+
+
 def serve(cfg: Config) -> int:
     """启动 Web 服务(模型预热 + 0.0.0.0 监听)。"""
     from ..store.db import DB
 
     db = DB(cfg.path("paths.db"))
-
     logger.info("预热模型(embedding + rerank,首次约 5 分钟)...")
     retriever = Retriever(cfg, db)
     t0 = time.time()
@@ -610,6 +652,10 @@ def serve(cfg: Config) -> int:
     Handler.answerer = _build_answerer(cfg)
     Handler.debug = bool(cfg.get("serve.debug", False))  # 调试模式(错误详情+跳转修复)
     Handler.debug_dir = str(cfg.path("paths.data_dir") / "debug")  # 错误报告落盘目录
+
+    # ── M11: 启动后后台消化一次对话记忆(不阻塞 UI 启动/首问) ──
+    if Handler.answerer is not None:
+        threading.Thread(target=_startup_digest, args=(cfg,), daemon=True).start()
 
     host = cfg.get("serve.host", "0.0.0.0")
     port = int(cfg.get("serve.port", 8765))
