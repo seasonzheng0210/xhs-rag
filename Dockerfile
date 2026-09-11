@@ -18,9 +18,14 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 # ── 2) 项目依赖(按 pyproject 可选组, 缓存友好: 代码改动不触发重装) ──
 # 先装 pinned 版本(lancedb/pyarrow 与本地索引格式兼容, 不可升级), 否则
 # `.[index]` 会先装最新版 lancedb 再被这里降级, 双倍下载/重装
+# ⚠️ extra 名必须与 pyproject 的 optional-dependencies 对齐(ocr/index/serve/agent):
+#    pyproject 里没有 "schedule" 组, 写成 .[ocr,index,schedule] 会让 pip 报
+#    "does not provide the extra 'schedule'"(仅 warning 不失败, 易被忽略)。
+#    serve 组是空列表(标准库实现零依赖), agent 组带 langgraph —— 容器里
+#    CLI 的 agent 子命令要用, 一并装上。
 COPY pyproject.toml README.md ./
 RUN pip install --no-cache-dir lancedb==0.37.1 pyarrow==25.0.1 \
- && pip install --no-cache-dir ".[ocr,index,schedule]" \
+ && pip install --no-cache-dir ".[ocr,index,agent]" \
  && pip install --no-cache-dir FlagEmbedding modelscope
 
 # ── 3) 项目代码 ──
