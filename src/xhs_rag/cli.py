@@ -513,8 +513,14 @@ def cmd_sync(cfg: Config, headless: bool = False,
     except Exception as e:
         logger.warning(f"覆盖检查跳过: {e}")
     bad = [k for k, v in results.items() if v]
-    logger.success(f"===== M7 sync 结束, 耗时 {time.time()-t0:.0f}s, "
+    dur = time.time() - t0
+    logger.success(f"===== M7 sync 结束, 耗时 {dur:.0f}s, "
                    f"各环节: {results}, 异常环节: {bad or '无'} =====")
+    # M7: 运行结果落盘（区分「任务未触发」vs「触发但失败」），best-effort
+    from .schedule import write_sync_state
+    cov = results.get("coverage", 1)
+    state_steps = {k: v for k, v in results.items() if k != "coverage"}
+    write_sync_state(cfg, state_steps, cov, dur)
     return 1 if bad else 0
 
 
@@ -628,6 +634,78 @@ def cmd_memory(cfg: Config, action: str, max_blocks: int = 6,
     return 1
 
 
+# ── schedule（M7 定时调度）────────────────────────────────
+def cmd_schedule(cfg: Config, action: str, at: str = "09:00") -> int:
+    """install/uninstall/status/run 四动作。设计见 docs/M7-调度设计.md。"""
+    import subprocess as sp
+
+    from . import schedule as sched
+
+    if action == "install":
+        rc, out = sched.install(at)
+        print(f"注册计划任务 {sched.TASK_NAME} (每日 {at}): "
+              f"{'成功' if rc == 0 else '失败'}")
+        if out:
+            print(out)
+        if rc == 0:
+            print(f"查看: taskschd.msc 搜索 {sched.TASK_NAME}，"
+                  f"或 python -m xhs_rag.cli schedule status")
+        return rc
+
+    if action == "uninstall":
+        rc, out = sched.uninstall()
+        print(f"删除计划任务 {sched.TASK_NAME}: "
+              f"{'成功' if rc == 0 else '失败(可能本就不存在)'}")
+        if out:
+            print(out)
+        return 0 if rc == 0 else 0  # 幂等：不存在也算卸载成功
+
+    if action == "status":
+        registered = sched.exists()
+        print(f"计划任务 {sched.TASK_NAME}: "
+              f"{'已注册' if registered else '未注册'}")
+        if registered:
+            _, out = sched.status_detail()
+            # 只挑关键行打印，避免 /V 长输出刷屏
+            keys = ("任务名", "TaskName", "状态", "Status",
+                    "下次运行时间", "Next Run Time",
+                    "上次运行时间", "Last Run Time",
+                    "上次结果", "Last Result", "要运行的任务", "Task To Run")
+            for line in out.splitlines():
+                if any(k in line for k in keys):
+                    print("  " + line.strip())
+        st = sched.read_sync_state(cfg)
+        if st:
+            print(f"上次同步: {st['finished_at']} 耗时 {st['duration_s']}s")
+            bad = [k for k, v in st["steps"].items() if v]
+            print(f"  各环节: {st['steps']}")
+            print(f"  异常环节: {bad or '无'} / 覆盖: "
+                  f"{'正常' if st['coverage'] == 0 else '有缺口'}")
+        else:
+            print("上次同步: 无记录（尚未跑过 sync 或状态文件缺失）")
+        return 0
+
+    if action == "run":
+        # 两条路径：任务已注册 → schtasks /Run 走系统调度链路（真实验证）；
+        # 未注册 → 直接前台跑 cmd_sync（验证流水线本身）。
+        if sched.exists():
+            rc, out = sched.trigger_once()
+            print(f"已触发 {sched.TASK_NAME} 立即运行"
+                  f"{'，退出码 ' + str(rc) if rc else ''}")
+            if out:
+                print(out)
+            if rc:
+                return rc
+            print("后台运行中，几分钟后用 status 查看结果"
+                  "（看 data/sync_state.json 的 finished_at 是否更新）")
+            return 0
+        print("任务未注册，前台直接跑 sync ...")
+        return cmd_sync(cfg)
+
+    print(f"未知 schedule 动作: {action}")
+    return 1
+
+
 # ── main ──────────────────────────────────────────────────
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="xhs", description="小红书收藏夹 RAG")
@@ -687,6 +765,14 @@ def main(argv: list[str] | None = None) -> int:
     pm_c = p_mem_sub.add_parser("clear", help="清空全部记忆（不可撤销）")
     pm_c.add_argument("--yes", action="store_true", help="跳过确认直接清空")
 
+    p_sched = sub.add_parser("schedule", help="定时调度（M7）：注册/卸载/状态/立即触发 Windows 计划任务")
+    p_sched_sub = p_sched.add_subparsers(dest="sched_action", required=True)
+    p_sched_i = p_sched_sub.add_parser("install", help="注册每日计划任务")
+    p_sched_i.add_argument("--at", default="09:00", help="每日触发时间 HH:MM（默认 09:00）")
+    p_sched_sub.add_parser("uninstall", help="删除计划任务")
+    p_sched_sub.add_parser("status", help="查看任务注册状态与上次同步结果")
+    p_sched_sub.add_parser("run", help="立即触发一次（已注册走系统调度，未注册前台直跑）")
+
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
     _setup(cfg, "DEBUG" if args.verbose else "INFO")
@@ -730,6 +816,8 @@ def main(argv: list[str] | None = None) -> int:
                           max_blocks=args.max_blocks
                           if args.mem_action == "digest" else 6,
                           yes=getattr(args, "yes", False))
+    if args.cmd == "schedule":
+        return cmd_schedule(cfg, args.sched_action, at=getattr(args, "at", "09:00"))
     if args.cmd == "mcp":
         from .mcp_server import main as mcp_main
 
