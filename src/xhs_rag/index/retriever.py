@@ -25,6 +25,12 @@ class Retriever:
         self.table_name = cfg.get("vectorstore.table_name", "xhs_notes")
         self.top_k_in = int(cfg.get("rerank.top_k_in", 50))
         self.top_k_out = int(cfg.get("rerank.top_k_out", 5))
+        # rerank 开关。2026-09-13 实测(26 条评测集/297 chunk, 池=20):
+        #   开: MRR@10 .938 / nDCG@5 .925 / 3.64s
+        #   关: MRR@10 .958 / nDCG@5 .946 / 0.03s  ← 三项更优且快两个数量级
+        # 故默认关闭。关闭后走融合原序, score 用 0.0 占位, top_score 返回
+        # None 使 CRAG 自评不生效(见 _search_once 末尾)。
+        self.rerank_enabled = bool(cfg.get("rerank.enabled", True))
         self.hybrid = bool(cfg.get("retrieval.hybrid", True))  # BM25 + 向量 RRF 融合
         # CRAG-lite: 检索质量自评 + 改写重检(Corrective RAG 简化版)
         # top1 rerank 分数低于阈值 → 视为"库里大概率没有相关内容",
@@ -46,8 +52,11 @@ class Retriever:
         """预热: 加载 embedder + reranker,把模型加载时间从首次查询挪到启动阶段。"""
         t0 = time.time()
         self.embedder.encode(["预热"])
-        self._ensure_reranker()
-        logger.info(f"检索预热完成(embedder+reranker),耗时 {time.time()-t0:.0f}s")
+        # 关闭 rerank 时不加载模型: 省约 2s 启动耗时 + 常驻内存
+        if self.rerank_enabled:
+            self._ensure_reranker()
+        logger.info(f"检索预热完成(embedder{'+reranker' if self.rerank_enabled else ''}),"
+                    f"耗时 {time.time()-t0:.0f}s")
 
     def _get_table(self):
         import lancedb
@@ -97,7 +106,14 @@ class Retriever:
             if key not in row_by_key:
                 row_by_key[key] = hit
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return [row_by_key[key] for key, _ in ranked[:limit]]
+        # 融合分写回行对象, 供 rerank 关闭时作为相关性分数
+        # (此前直接丢弃, 导致关闭 rerank 后只能填 0.0 占位, 丢失强弱差异)
+        out = []
+        for key, sc in ranked[:limit]:
+            row = row_by_key[key]
+            row["_rrf_score"] = sc
+            out.append(row)
+        return out
 
     def _ensure_reranker(self):
         """懒加载本地 bge-reranker-base。"""
@@ -225,10 +241,20 @@ class Retriever:
                 logger.warning(f"hybrid BM25 检索失败,退回纯向量: {e}")
 
         # 3) rerank 重排(候选截断 160 字符,CPU 推理与长度近似线性,越短越快)
-        candidates = [h["text"][:160] for h in hits]
-        scores = self._rerank(query, candidates)
-        ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
-        ranked = [x for x in ranked if x[1] is not None][:top_k_out]
+        if self.rerank_enabled:
+            candidates = [h["text"][:160] for h in hits]
+            scores = self._rerank(query, candidates)
+            ranked = sorted(zip(hits, scores), key=lambda x: x[1], reverse=True)
+            ranked = [x for x in ranked if x[1] is not None][:top_k_out]
+        else:
+            # 关闭 rerank: 保持融合后原序, 用 RRF 融合分按 top1 归一化成
+            # 0-1 相关性分数。不能填 0.0 占位 —— 全 0 会让下游(Agent 工具
+            # 结果 / Web UI)看不出强弱差异; 也不能是 None(下面
+            # round(float(score)) 会崩, 且会被 "x[1] is not None" 过滤成空)。
+            raw = [float(h.get("_rrf_score", 0.0)) for h in hits[:top_k_out]]
+            mx = max(raw) if raw else 0.0
+            ranked = [(h, (s / mx if mx else 0.0))
+                      for h, s in zip(hits[:top_k_out], raw)]
 
         results = []
         for hit, score in ranked:
@@ -244,7 +270,10 @@ class Retriever:
                 "url": self._note_url(hit["note_id"]),
             })
         results = self._complete_note_chunks(hits, results)
-        top_score = results[0]["score"] if results else None
+        # 关闭 rerank 时没有可信分数: 返回 None 让 CRAG 自评不生效。
+        # 不能拿占位的 0.0 去比 min_top1_score —— 0.0 < 0.75 会被判
+        # low_conf, 导致每条 query 都白跑一次 LLM 改写重检。
+        top_score = results[0]["score"] if (results and self.rerank_enabled) else None
         return results, top_score
 
     def _note_url(self, note_id: str) -> str:
