@@ -642,7 +642,7 @@ def cmd_schedule(cfg: Config, action: str, at: str = "09:00") -> int:
     from . import schedule as sched
 
     if action == "install":
-        rc, out = sched.install(at)
+        rc, out = sched.install(cfg, at)
         print(f"注册计划任务 {sched.TASK_NAME} (每日 {at}): "
               f"{'成功' if rc == 0 else '失败'}")
         if out:

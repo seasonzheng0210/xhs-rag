@@ -25,12 +25,16 @@ def _pythonw() -> str:
     return str(pyw if pyw.exists() else exe)
 
 
-def build_create_cmd(at: str) -> list[str]:
-    """schtasks /Create 参数列表。/TR 内嵌引号用 \\" 转义。"""
-    tr = f'\\"{_pythonw()}\\" -m xhs_rag.cli sync'
+def build_create_cmd(script: str, at: str) -> list[str]:
+    """schtasks /Create 参数列表。
+
+    /TR 指向包装 cmd 脚本（**绝不用 \\" 转义内嵌引号**——2026-09-16 实测：
+    schtasks 会把 \\" 原样存进任务定义，触发时报 0x80070002 文件未找到）。
+    脚本路径由 ensure_task_script() 生成，位于项目内且不含空格。
+    """
     return ["schtasks", "/Create", "/F",
             "/TN", TASK_NAME,
-            "/TR", tr,
+            "/TR", script,
             "/SC", "DAILY",
             "/ST", at]
 
@@ -48,6 +52,41 @@ def build_run_cmd() -> list[str]:
     return ["schtasks", "/Run", "/TN", TASK_NAME]
 
 
+# ── 包装脚本（解决工作目录 + 引号两个坑）─────────────────
+SCRIPT_NAME = "sync_task.cmd"
+
+
+def task_script_path(cfg) -> Path:
+    return cfg.root / "scripts" / SCRIPT_NAME
+
+
+def ensure_task_script(cfg) -> Path:
+    """生成/覆盖包装 cmd 脚本。
+
+    计划任务由 Task Scheduler 拉起时工作目录是 C:\\Windows\\System32，
+    直接 `pythonw -m xhs_rag.cli` 会 ImportError（找不到 xhs_rag 包）。
+    脚本里先 `cd /d` 到项目根，再调解释器；路径全 ASCII 且无空格，
+    因此 /TR 无需任何引号，彻底避开 schtasks 的转义坑。
+    """
+    p = task_script_path(cfg)
+    log = f"{cfg.root}\\data\\logs\\task_sync.log"
+    body = (
+        "@echo off\r\n"
+        "rem M7 计划任务入口，由 xhs_rag.schedule 自动生成，勿手工修改\r\n"
+        f'echo [%date% %time%] M7 sync 被触发 >> "{log}"\r\n'
+        f'cd /d "{cfg.root}"\r\n'
+        f'"{sys.executable}" -m xhs_rag.cli sync >> "{log}" 2>&1\r\n'
+        f'echo [%date% %time%] M7 sync 结束, rc=%ERRORLEVEL% >> "{log}"\r\n'
+    )
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # 内容为 ASCII；若项目根含中文路径则退回 GBK（cmd 默认代码页）
+    try:
+        p.write_text(body, encoding="ascii")
+    except UnicodeEncodeError:
+        p.write_text(body, encoding="gbk", errors="replace")
+    return p
+
+
 # ── 执行封装 ──────────────────────────────────────────────
 def _run(cmd: list[str]) -> tuple[int, str]:
     try:
@@ -61,9 +100,10 @@ def _run(cmd: list[str]) -> tuple[int, str]:
     return p.returncode, out or err
 
 
-def install(at: str = "09:00") -> tuple[int, str]:
-    """注册计划任务（/F 幂等覆盖）。返回 (rc, 输出)。"""
-    return _run(build_create_cmd(at))
+def install(cfg, at: str = "09:00") -> tuple[int, str]:
+    """生成包装脚本并注册计划任务（/F 幂等覆盖）。返回 (rc, 输出)。"""
+    script = ensure_task_script(cfg)
+    return _run(build_create_cmd(str(script), at))
 
 
 def uninstall() -> tuple[int, str]:
