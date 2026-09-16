@@ -1,6 +1,8 @@
-@echo off
-rem M7 ¼Æ»®ÈÎÎñÈë¿Ú£¬ÓÉ xhs_rag.schedule ×Ô¶¯Éú³É£¬ÎðÊÖ¹¤ÐÞ¸Ä
-echo [%date% %time%] M7 sync ±»´¥·¢ >> "C:\Users\Administrator\.workbuddy\2026-08-29-16-20-26\xhs-rag\data\logs\task_sync.log"
+ï»¿@echo off
+chcp 65001 >nul
+rem M7 è®¡åˆ’ä»»åŠ¡å…¥å£ï¼Œç”± xhs_rag.schedule è‡ªåŠ¨ç”Ÿæˆï¼Œå‹¿æ‰‹å·¥ä¿®æ”¹
+for %%A in ("C:\Users\Administrator\.workbuddy\2026-08-29-16-20-26\xhs-rag\data\logs\task_sync.log") do if %%~zA GTR 1048576 break > "C:\Users\Administrator\.workbuddy\2026-08-29-16-20-26\xhs-rag\data\logs\task_sync.log"
+echo [%date% %time%] M7 sync è¢«è§¦å‘ >> "C:\Users\Administrator\.workbuddy\2026-08-29-16-20-26\xhs-rag\data\logs\task_sync.log"
 cd /d "C:\Users\Administrator\.workbuddy\2026-08-29-16-20-26\xhs-rag"
 "C:\Users\Administrator\.workbuddy\binaries\python\envs\xhs-rag\Scripts\python.exe" -m xhs_rag.cli sync >> "C:\Users\Administrator\.workbuddy\2026-08-29-16-20-26\xhs-rag\data\logs\task_sync.log" 2>&1
-echo [%date% %time%] M7 sync ½áÊø, rc=%ERRORLEVEL% >> "C:\Users\Administrator\.workbuddy\2026-08-29-16-20-26\xhs-rag\data\logs\task_sync.log"
+echo [%date% %time%] M7 sync ç»“æŸ, rc=%ERRORLEVEL% >> "C:\Users\Administrator\.workbuddy\2026-08-29-16-20-26\xhs-rag\data\logs\task_sync.log"

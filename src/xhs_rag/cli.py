@@ -142,7 +142,8 @@ def cmd_check(cfg: Config, online: bool = True) -> int:
 
 
 # ── collect ───────────────────────────────────────────────
-def cmd_collect(cfg: Config, headless: bool | None = None, max_pages: int = 200) -> int:
+def cmd_collect(cfg: Config, headless: bool | None = None, max_pages: int = 200,
+                manage_run: bool = True, trigger: str = "manual") -> int:
     from .auth import session
     from .auth.session import CaptchaRequired
     from .crawler.browser import BrowserSession
@@ -165,8 +166,11 @@ def cmd_collect(cfg: Config, headless: bool | None = None, max_pages: int = 200)
 
     cfg.ensure_dirs("paths.data_dir", "paths.jsonl_dir", "paths.db")
     db = DB(cfg.path("paths.db"))
-    run_id = db.start_run("manual")
-    jsonl = cfg.path("paths.jsonl_dir") / f"collect_{run_id}.jsonl"
+    # 唯一 run 由 cmd_sync 持有（manage_run=False 时跳过，避免同一次同步多行 run）
+    run_id = db.start_run(trigger) if manage_run else None
+    # jsonl 落盘名：manage_run=False 时用时间戳占位，保证 CollectCrawler 总有落点
+    run_label = run_id or f"sched-{int(time.time() * 1000)}"
+    jsonl = cfg.path("paths.jsonl_dir") / f"collect_{run_label}.jsonl"
 
     logger.info(f"开始同步收藏列表（run={run_id}，落盘 {jsonl}）")
     try:
@@ -192,11 +196,17 @@ def cmd_collect(cfg: Config, headless: bool | None = None, max_pages: int = 200)
             f"触发验证码风控（{e}）。本次已抓到的数据已落库，下次续跑即可。\n"
             "        处理：停止一切自动化访问，用日常浏览器正常浏览小红书一段时间冷却后再试。"
         )
-        db.finish_run(run_id, "failed", listed=db.count("listed"))
+        if manage_run:
+            db.finish_run(run_id, "failed", listed=db.count("listed"))
+        else:
+            db.close()  # manage_run=False 时跳过 finish_run（其内部已 commit），需自行提交释放写锁
         return 1
     except Exception as e:
         logger.exception(f"采集异常终止: {e}")
-        db.finish_run(run_id, "failed", listed=db.count("listed"))
+        if manage_run:
+            db.finish_run(run_id, "failed", listed=db.count("listed"))
+        else:
+            db.close()
         return 1
 
     total = db.count()
@@ -206,15 +216,19 @@ def cmd_collect(cfg: Config, headless: bool | None = None, max_pages: int = 200)
         f"库内共 {total} 条（{listed} 条已 listed）"
     )
     logger.info(f"停止原因：{result.stopped_reason}")
-    db.finish_run(run_id, "success",
-                  listed=listed, new_notes=len(result.note_ids))
+    if manage_run:
+        db.finish_run(run_id, "success",
+                      listed=listed, new_notes=len(result.note_ids))
+    else:
+        db.close()
     return 0
 
 
 # ── detail ────────────────────────────────────────────────
 def cmd_detail(cfg: Config, headless: bool | None = None,
                limit: int | None = None, note_id: str | None = None,
-               skip_media: bool = False) -> int:
+               skip_media: bool = False,
+               manage_run: bool = True, trigger: str = "manual") -> int:
     """M2：抓详情 + 下载媒体。
 
     流程：取 status='listed' 的笔记 → 逐条打开详情页提取正文/图片/视频
@@ -236,7 +250,8 @@ def cmd_detail(cfg: Config, headless: bool | None = None,
 
     cfg.ensure_dirs("paths.data_dir", "paths.db")
     db = DB(cfg.path("paths.db"))
-    run_id = db.start_run("manual")
+    # 唯一 run 由 cmd_sync 持有（manage_run=False 时跳过，避免同一次同步多行 run）
+    run_id = db.start_run(trigger) if manage_run else None
 
     # 取待处理笔记
     if note_id:
@@ -324,13 +339,19 @@ def cmd_detail(cfg: Config, headless: bool | None = None,
                 _t.sleep(_jitter() / 1000)
 
         logger.success(f"M2 完成：成功 {done} 条，失败 {failed} 条")
-        db.finish_run(run_id, "success" if not failed else "failed",
-                      updated=done)
+        if manage_run:
+            db.finish_run(run_id, "success" if not failed else "failed",
+                          updated=done)
+        else:
+            db.close()
         return 0 if not failed else 1
 
     except Exception as e:
         logger.exception(f"M2 异常终止: {e}")
-        db.finish_run(run_id, "failed", updated=done)
+        if manage_run:
+            db.finish_run(run_id, "failed", updated=done)
+        else:
+            db.close()
         return 1
 
 
@@ -492,36 +513,72 @@ def cmd_sync(cfg: Config, headless: bool = False,
     collect → detail → ocr → video → index，各环节断点续传天然增量：
     - 新增收藏才会进库，重复的 upsert 刷新互动数据
     - detail 只处理 listed，ocr 跳过已识别，video 跳过已转写，index 跳过已向量化
-    适合定时任务：无人值守，每次只处理增量，风控触发时数据已落库、下次续跑。
+    适合定时任务：交互会话内运行（锁屏仍运行，重启后登录补跑），每次只处理增量，
+    风控触发时数据已落库、下次续跑。
+
+    Q1：整次同步持有唯一一条 sync_runs 记录（trigger=scheduled），
+    子步骤传 manage_run=False，避免同一次同步产生多行 run。
+    硬崩溃（进程被杀/OOM/异常中断）也落 failed，便于 status 区分「中途死了」。
     """
+    from .store.db import DB
+    from .index.indexer import Indexer
+    from .schedule import write_sync_state
+
+    db = DB(cfg.path("paths.db"))
+    run_id = db.start_run("scheduled")  # 唯一 run，覆盖整次同步
+
     t0 = time.time()
-    results = {}
+    results: dict[str, int] = {}
     logger.info("===== M7 sync 开始 =====")
-    results["collect"] = cmd_collect(cfg, headless=headless, max_pages=max_pages)
-    results["detail"] = cmd_detail(cfg, headless=headless, skip_media=skip_media)
-    results["ocr"] = cmd_ocr(cfg)
-    results["video"] = cmd_video(cfg)
-    results["index"] = cmd_index(cfg)
+
+    def _finish(error_msg: str | None = None) -> int:
+        bad = [k for k, v in results.items() if v]
+        dur = time.time() - t0
+        listed = indexed = 0
+        try:
+            listed = db.count("listed")
+            indexed = Indexer(cfg).count_indexed()
+        except Exception as e:
+            logger.warning(f"计数跳过: {e}")
+        if error_msg or bad:
+            msg = error_msg or f"异常环节: {', '.join(bad)}"
+            db.finish_run(run_id, "failed", listed=listed, indexed=indexed,
+                          error_msg=msg)
+        else:
+            db.finish_run(run_id, "success", listed=listed, indexed=indexed)
+        # 兜底通道：保留 sync_state.json 写入（status 兼容回退）
+        cov = results.get("coverage", 1)
+        state_steps = {k: v for k, v in results.items() if k != "coverage"}
+        write_sync_state(cfg, state_steps, cov, dur)
+        logger.success(
+            f"===== M7 sync 结束, 耗时 {dur:.0f}s, "
+            f"各环节: {results}, 异常环节: {bad or '无'} ====="
+        )
+        return 1 if (error_msg or bad) else 0
+
+    try:
+        results["collect"] = cmd_collect(
+            cfg, headless=headless, max_pages=max_pages,
+            manage_run=False, trigger="scheduled")
+        results["detail"] = cmd_detail(
+            cfg, headless=headless, skip_media=skip_media,
+            manage_run=False, trigger="scheduled")
+        results["ocr"] = cmd_ocr(cfg)
+        results["video"] = cmd_video(cfg)
+        results["index"] = cmd_index(cfg)
+    except Exception as e:
+        logger.exception(f"sync 异常中断: {e}")
+        return _finish(error_msg=f"sync 异常中断: {e}")
+
     # 幂等检查：确认最新笔记已进索引
     try:
-        from .store.db import DB
-        from .index.indexer import Indexer
-        db = DB(cfg.path("paths.db"))
         n_total, n_indexed = db.count(), Indexer(cfg).count_indexed()
         results["coverage"] = 0 if n_indexed >= n_total else 1
         logger.info(f"覆盖: {n_indexed}/{n_total} 篇已入索引")
     except Exception as e:
         logger.warning(f"覆盖检查跳过: {e}")
-    bad = [k for k, v in results.items() if v]
-    dur = time.time() - t0
-    logger.success(f"===== M7 sync 结束, 耗时 {dur:.0f}s, "
-                   f"各环节: {results}, 异常环节: {bad or '无'} =====")
-    # M7: 运行结果落盘（区分「任务未触发」vs「触发但失败」），best-effort
-    from .schedule import write_sync_state
-    cov = results.get("coverage", 1)
-    state_steps = {k: v for k, v in results.items() if k != "coverage"}
-    write_sync_state(cfg, state_steps, cov, dur)
-    return 1 if bad else 0
+
+    return _finish()
 
 
 # ── setup ────────────────────────────────────────────────
@@ -676,11 +733,22 @@ def cmd_schedule(cfg: Config, action: str, at: str = "09:00") -> int:
                     print("  " + line.strip())
         st = sched.read_sync_state(cfg)
         if st:
-            print(f"上次同步: {st['finished_at']} 耗时 {st['duration_s']}s")
-            bad = [k for k, v in st["steps"].items() if v]
-            print(f"  各环节: {st['steps']}")
-            print(f"  异常环节: {bad or '无'} / 覆盖: "
-                  f"{'正常' if st['coverage'] == 0 else '有缺口'}")
+            src = st.get("source", "json")
+            if st.get("running"):
+                # Q4：被硬杀留下的孤儿行（status=running，无 finished_at）
+                print(f"上次同步: ⚠ 中途未结束（running，始于 {st['started_at']}）"
+                      f"—— 可能进程被强杀，建议重跑 sync")
+            else:
+                print(f"上次同步: {st['finished_at']} 耗时 {st['duration_s']}s"
+                      f"（来源: {src}）")
+                bad = [k for k, v in st.get('steps', {}).items() if v]
+                print(f"  各环节: {st.get('steps', {})}")
+                print(f"  异常环节: {bad or '无'} / 覆盖: "
+                      f"{'正常' if st.get('coverage') == 0 else '有缺口'}")
+                print(f"  状态: {st.get('status')} "
+                      f"库内 listed={st.get('listed')} indexed={st.get('indexed')}")
+                if st.get("error_msg"):
+                    print(f"  错误: {st['error_msg']}")
         else:
             print("上次同步: 无记录（尚未跑过 sync 或状态文件缺失）")
         return 0
