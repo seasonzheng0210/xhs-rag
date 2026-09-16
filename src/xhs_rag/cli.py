@@ -643,7 +643,63 @@ def cmd_sync(cfg: Config, headless: bool = False,
     except Exception as e:
         logger.warning(f"覆盖检查跳过: {e}")
 
+    # P0（2026-09-16）：长期记忆消化挂到同步尾部。
+    #   此前 digest 只在 serve 启动时后台跑一次 —— 纯 CLI / 只跑定时同步的用法下，
+    #   对话永远躺在 dialog_log 里没被消化，"长期记忆"等于装了但从没跑过。
+    #   放在 _finish() 之前、且不写 results（results 非零即算"异常环节"会把同步判失败）。
+    _maybe_auto_digest(cfg)
+
     return _finish()
+
+
+def _maybe_auto_digest(cfg: Config) -> None:
+    """M11 记忆消化：同步尾部自动跑一次（P0, 2026-09-16）。
+
+    三条硬约束：
+    - **空跑要便宜**：没有待消化对话时立刻返回，不构造 Answerer
+      （否则每次同步白付 10–20s 模型加载）。
+    - **绝不能拖垮同步**：整段 try/except 吞掉，任何异常只 warning 级别记录 +
+      （失败时）发 warning 告警，同步的退出码不受影响。
+    - **不进 results**：`_finish()` 里 `results` 任何非零值都判定为"异常环节"→ 同步 failed，
+      所以消化结果用独立变量/日志承载。
+    """
+    if not cfg.get("memory.auto_digest", True):
+        logger.info("记忆消化: 配置关闭 (memory.auto_digest=false)，跳过")
+        return
+    db_path = str(cfg.path("paths.db"))
+    try:
+        from .memory import counts, run_digest
+
+        pending = counts(db_path).get("pending_rounds", 0)
+        if not pending:
+            logger.info("记忆消化: 无待处理对话，跳过")
+            return
+
+        from .qa.answer import Answerer
+
+        logger.info(f"记忆消化: 待处理 {pending} 轮，开始加工...")
+        out = run_digest(
+            db_path, Answerer(cfg), verbose=False,
+            max_blocks=int(cfg.get("memory.auto_digest_blocks", 6)),
+        )
+        if out.get("error"):
+            logger.warning(f"记忆消化跳过（LLM 不可用？）: {out['error']}")
+            return
+        logger.info(
+            f"记忆消化完成: 块 {out.get('processed_blocks', 0)}"
+            f" / 轮 {out.get('rounds', 0)}"
+            f" / 摘要 {out.get('summaries', 0)}"
+            f" / 画像 {out.get('profiles', 0)}"
+            f" / 失败 {out.get('errors', 0)}"
+        )
+        if out.get("errors"):
+            from .notify import notify
+
+            notify(cfg, "memory_digest_failed", "长期记忆消化部分失败",
+                   f"{out['errors']} 个对话块加工失败（未标记已消化，下次同步自动重试）",
+                   level="warning")
+    except Exception as e:  # 消化是附加能力，绝不因它让同步失败
+        logger.warning(f"记忆消化异常（已忽略，不影响同步）: {e}")
 
 
 # ── setup ────────────────────────────────────────────────
