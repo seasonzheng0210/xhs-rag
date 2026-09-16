@@ -12,7 +12,8 @@
 
 工具：
   - search(query, k=5)  语义检索收藏夹，返回带原帖链接的结果列表
-  - ask(query)          检索 + LLM 生成带引用的回答（LLM 不可用时退化为 search）
+  - ask(query)          检索 + LLM 生成带引用的回答（LLM 不可用时退化为 search；
+                        自动注入 M11 长期记忆背景注记，并把本轮问答落盘供离线 digest）
   - stats()             收藏库统计（笔记/图片/视频/ASR 字符/chunks）
 
 模型在 mcp.run() 前的主线程预热（约 10-20s，与 web serve 同策略），工具调用即时返回。
@@ -120,7 +121,15 @@ def _tool_search(query: str, k: int = 5) -> str:
     }, ensure_ascii=False, indent=2)
 
 
-def _tool_ask(query: str, history: list[dict] | None = None) -> str:
+def _tool_ask(query: str, history: list[dict] | None = None,
+              record: bool = True) -> str:
+    """record=False 时不把本轮对话写进长期记忆。
+
+    调用方语义：MCP 工具入口（真人问）用默认 True；Agent 的 ask 工具
+    按父会话决定 —— 非用户会话（脚本/评测）必须传 False，否则
+    test_agent_cases 之类的回归会把测试问答当用户对话写进 dialog_log，
+    下一个 digest 就把它摘要成"用户偏好"（2026-09-16 实测踩到过）。
+    """
     if not query.strip():
         return json.dumps({"error": "query 不能为空"}, ensure_ascii=False)
     ctx = _get_ctx()
@@ -139,6 +148,16 @@ def _tool_ask(query: str, history: list[dict] | None = None) -> str:
     rewrite_fn = None
     if ctx["answerer"] is not None:
         rewrite_fn = lambda qq: ctx["answerer"].rewrite_query(qq)  # noqa: E731
+    # ── M11: 记忆背景注记（摘要+画像）。与 serve /api/answer 同入口。──
+    memory_note = ""
+    log_fn = None
+    try:
+        from .memory import log_dialog, recent_context
+
+        log_fn = log_dialog if record else None
+        memory_note = recent_context(ctx["db_path"])
+    except Exception as e:
+        logger.warning(f"记忆背景注记读取失败(忽略): {e}")
     results = _enrich(ctx["retriever"].search(search_q, rewrite_fn=rewrite_fn))
     out: dict = {"query": q, "search_secs": round(time.time() - t0, 1),
                  "answer": "", "model": "", "results": [_trim(r, 200) for r in results]}
@@ -153,9 +172,14 @@ def _tool_ask(query: str, history: list[dict] | None = None) -> str:
         return json.dumps(out, ensure_ascii=False, indent=2)
     try:
         t1 = time.time()
-        out["answer"] = answerer.answer(q, results, history or None)
+        # M11: 对话原文落盘 + 背景注记注入同一处，保证「问了 → 记住」闭环。
+        if log_fn:
+            log_fn(ctx["db_path"], "user", q, "mcp")
+        out["answer"] = answerer.answer(q, results, history or None, memory_note)
         out["model"] = answerer.model
         out["llm_secs"] = round(time.time() - t1, 1)
+        if log_fn:
+            log_fn(ctx["db_path"], "assistant", out["answer"], "mcp")
     except Exception as e:
         logger.warning(f"AI 回答失败: {e}")
         out["answer"] = f"（AI 回答失败：{e}）检索到以下内容，请自行查阅。"

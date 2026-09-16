@@ -32,6 +32,16 @@ class Retriever:
         # None 使 CRAG 自评不生效(见 _search_once 末尾)。
         self.rerank_enabled = bool(cfg.get("rerank.enabled", True))
         self.hybrid = bool(cfg.get("retrieval.hybrid", True))  # BM25 + 向量 RRF 融合
+        # RRF 融合口径（P2-2 检索前自适应路由的底座）：
+        #   concat   左旧行为：把 dense+sparse 拼起来按**全局** rank 累加，
+        #            等于给 dense 一个固定顺位优势（20 条池时 dense 占 rank
+        #            0-19、sparse 占 20-39），偏离标准 RRF 定义
+        #   per_list 标准 RRF：score = Σ_lists w_l / (k + rank_in_list + 1)
+        # 权重 weights=[dense_w, sparse_w] 只在 per_list 下生效。
+        self.rrf_mode = str(cfg.get("retrieval.rrf.mode", "concat"))
+        _w = cfg.get("retrieval.rrf.weights", [1.0, 1.0]) or [1.0, 1.0]
+        self.rrf_weights = (float(_w[0]), float(_w[1]))
+        self.rrf_k = int(cfg.get("retrieval.rrf.k", 60))
         # CRAG-lite: 检索质量自评 + 改写重检(Corrective RAG 简化版)
         # top1 rerank 分数低于阈值 → 视为"库里大概率没有相关内容",
         # 注入 rewrite_fn 时自动改写重检一次; 仍低则结果标 low_confidence
@@ -90,21 +100,33 @@ class Retriever:
 
     @staticmethod
     def _rrf_merge(dense: list[dict], sparse: list[dict],
-                   limit: int, k: int = 60) -> list[dict]:
+                   limit: int, k: int = 60, mode: str = "concat",
+                   weights: tuple[float, float] = (1.0, 1.0)) -> list[dict]:
         """Reciprocal Rank Fusion: score = Σ 1/(k + rank),取两路前 limit 候选。
 
         以 (note_id, seq) 为键合并(seq 缺省退化为 note_id),返回保持各自字段的
         行对象列表,按融合分降序截断 —— rerank 前的候选池,不改变下游字段契约。
+
+        mode/weights 见 Retriever.__init__；默认 concat 保持既有生产行为。
         """
         from collections import defaultdict
 
         scores: dict[tuple, float] = defaultdict(float)
         row_by_key: dict[tuple, dict] = {}
-        for rank, hit in enumerate(dense + sparse):
-            key = (hit["note_id"], hit.get("seq"))
-            scores[key] += 1.0 / (k + rank + 1)
-            if key not in row_by_key:
-                row_by_key[key] = hit
+        if mode == "per_list":
+            wd, ws = weights
+            for lst, w in ((dense, wd), (sparse, ws)):
+                for rank, hit in enumerate(lst):
+                    key = (hit["note_id"], hit.get("seq"))
+                    scores[key] += w / (k + rank + 1)
+                    if key not in row_by_key:
+                        row_by_key[key] = hit
+        else:
+            for rank, hit in enumerate(dense + sparse):
+                key = (hit["note_id"], hit.get("seq"))
+                scores[key] += 1.0 / (k + rank + 1)
+                if key not in row_by_key:
+                    row_by_key[key] = hit
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         # 融合分写回行对象, 供 rerank 关闭时作为相关性分数
         # (此前直接丢弃, 导致关闭 rerank 后只能填 0.0 占位, 丢失强弱差异)
@@ -236,7 +258,9 @@ class Retriever:
             try:
                 sparse = self._bm25_search(query, top_k_in)
                 if sparse:
-                    hits = self._rrf_merge(hits, sparse, top_k_in)
+                    hits = self._rrf_merge(hits, sparse, top_k_in,
+                                           k=self.rrf_k, mode=self.rrf_mode,
+                                           weights=self.rrf_weights)
             except Exception as e:
                 logger.warning(f"hybrid BM25 检索失败,退回纯向量: {e}")
 

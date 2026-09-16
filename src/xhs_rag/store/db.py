@@ -229,7 +229,36 @@ class DB:
     # ──────────────────────────────────────────────────────
     # sync_runs —— 每次同步可观测 + 可断点续传
     # ──────────────────────────────────────────────────────
+    def reap_stale_runs(self, max_age_h: float = 6.0) -> int:
+        """把卡在 running 的僵尸同步行标成 aborted，返回清理条数。
+
+        场景：同步中途进程被杀 / 机器重启 / 崩溃，finish_run 来不及执行，
+        该行就永远停在 running，让 schedule status 与 Web 同步面板谎报
+        "有 N 轮在运行中"（2026-09-16 实测库里积了 3 条，最早 08-31，
+        最久 392 小时，finished_at 全为 NULL）。
+
+        判据用 started_at 年龄而非心跳：一次同步实测 30s 量级（全量分钟级），
+        超过 max_age_h 还在 running 的必然不是活着的。由 start_run 先调用，
+        自愈式清理，且不会碰到真正在跑的那一轮。
+        """
+        now_ms = int(time.time() * 1000)
+        cutoff = now_ms - int(max_age_h * 3600 * 1000)
+        cur = self.conn.execute(
+            "UPDATE sync_runs SET finished_at=?, status='aborted', "
+            "error_msg=COALESCE(error_msg, '进程中断未收尾（自动标记）') "
+            "WHERE status='running' AND started_at < ?",
+            (now_ms, cutoff),
+        )
+        self.conn.commit()
+        n = cur.rowcount or 0
+        if n:
+            logger.warning(f"清理僵尸同步记录 {n} 条（running 超 {max_age_h}h）")
+        return n
+
     def start_run(self, trigger: str = "manual") -> str:
+        # 开新同步前先收尸：把上次崩溃遗留的 running 行关掉，
+        # 否则 sync_runs 里的"运行中"会永久累积，污染状态读取与 Web 面板。
+        self.reap_stale_runs()
         run_id = uuid.uuid4().hex[:12]
         self.conn.execute(
             "INSERT INTO sync_runs (run_id, started_at, trigger, status) VALUES (?,?,?,?)",

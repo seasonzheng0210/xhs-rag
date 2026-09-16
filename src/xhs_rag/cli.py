@@ -162,6 +162,10 @@ def cmd_collect(cfg: Config, headless: bool | None = None, max_pages: int = 200,
     ok_local, reason = session.has_stored_session(cfg)
     if not ok_local:
         logger.error(f"无有效登录态：{reason}。先跑 python -m xhs_rag.cli login")
+        # P1-1 失败告警：独立调用时才报（sync 内部由 cmd_sync 统一告警，避免重复）
+        if manage_run and cfg.get("auth.notify_on_expire", True):
+            from .notify import notify
+            notify(cfg, "login_expired", "登录态失效", f"{reason}（采集未执行）")
         return 2
 
     cfg.ensure_dirs("paths.data_dir", "paths.jsonl_dir", "paths.db")
@@ -438,7 +442,7 @@ def cmd_agent(cfg: Config, query: str, max_steps: int = 8) -> int:
         logger.error(f"Agent 需要 LLM：{why}")
         return 1
     print(f"\n『{query}』 Agent 决策循环（max_steps={max_steps}）:\n")
-    agent = RAGAgent(cfg, verbose=True, max_steps=max_steps)
+    agent = RAGAgent(cfg, verbose=True, max_steps=max_steps, session="cli")
     result = agent.run(query)
     print(f"\n{'=' * 60}")
     print(f"（{result['steps']} 步工具调用 / {result['secs']}s"
@@ -447,10 +451,52 @@ def cmd_agent(cfg: Config, query: str, max_steps: int = 8) -> int:
     return 0
 
 
-def cmd_search(cfg: Config, query: str, k: int = 5) -> int:
-    """M5：语义检索（本地 embedding + rerank）。"""
+def _ocr_query(cfg: Config, image: str) -> str | None:
+    """P2-3 查询端多模态：把用户给的截图 OCR 成检索词。
+
+    复用采集侧同一套 OcrEngine（本地 RapidOCR 优先，命中 escalate 条件
+    才上云 VLM 兜底），因此不需要任何新依赖。
+    在 CLI 主线程里加载 OCR 模型——避开 Windows 工作线程里首次加载
+    推理引擎死等的坑（同 mcp_server 顶部的说明）。
+    返回压平后的检索词；无文字/失败返回 None。
+    """
+    from .process.ocr import OcrEngine
+
+    p = Path(image).expanduser()
+    if not p.exists():
+        logger.error(f"图片不存在：{p}")
+        return None
+    t0 = time.time()
+    try:
+        res = OcrEngine(cfg).ocr_image(p)
+    except Exception as e:
+        logger.error(f"图片 OCR 失败：{e}")
+        return None
+    text = (res or {}).get("text") or ""
+    # OCR 是多行的，检索词要压成单行并去掉过短的噪声行
+    lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) >= 2]
+    query = " ".join(lines).strip()[:300]
+    if not query:
+        logger.warning(f"图片没识别出可用文字：{p.name}")
+        return None
+    logger.info(f"图片检索词（{res.get('engine')} / conf="
+                f"{res.get('confidence', 0):.2f} / {time.time() - t0:.1f}s）："
+                f"{query[:80]}")
+    return query
+
+
+def cmd_search(cfg: Config, query: str, k: int = 5,
+               image: str | None = None) -> int:
+    """M5：语义检索（本地 embedding + rerank）。--image 时先 OCR 成检索词。"""
     from .index.retriever import Retriever
     from .store.db import DB
+
+    if image:
+        ocr_q = _ocr_query(cfg, image)
+        if not ocr_q:
+            return 1
+        # 文字检索词 + 图片文字一起用（截图的正文常比用户手打的关键词更全）
+        query = f"{query} {ocr_q}".strip() if query else ocr_q
 
     cfg.ensure_dirs("paths.data_dir", "paths.db")
     db = DB(cfg.path("paths.db"))
@@ -468,12 +514,18 @@ def cmd_search(cfg: Config, query: str, k: int = 5) -> int:
     return 0
 
 
-def cmd_ask(cfg: Config, query: str, k: int = 5) -> int:
+def cmd_ask(cfg: Config, query: str, k: int = 5,
+            image: str | None = None) -> int:
     """M8：检索 + LLM 生成带引用的回答（终端流式打印，方便调 prompt）。"""
     from .index.retriever import Retriever
     from .qa.answer import Answerer, LLMUnavailable, pretty_stream
     from .store.db import DB
 
+    if image:
+        ocr_q = _ocr_query(cfg, image)
+        if not ocr_q:
+            return 1
+        query = f"{query} {ocr_q}".strip() if query else ocr_q
     cfg.ensure_dirs("paths.data_dir", "paths.db")
     db = DB(cfg.path("paths.db"))
     r = Retriever(cfg, db)
@@ -544,12 +596,25 @@ def cmd_sync(cfg: Config, headless: bool = False,
             msg = error_msg or f"异常环节: {', '.join(bad)}"
             db.finish_run(run_id, "failed", listed=listed, indexed=indexed,
                           error_msg=msg)
+            # P1-1 失败告警：定时任务无人值守，失败必须能被看见（Web 横幅/CLI/桌面）
+            from .notify import notify
+            if results.get("collect") == 2:  # cmd_collect 约定 2=登录态失效
+                kind, title = "login_expired", "定时同步失败：登录态失效"
+            else:
+                kind, title = "sync_failed", "定时同步失败"
+            notify(cfg, kind, title, f"{msg}（耗时 {dur:.0f}s）")
         else:
             db.finish_run(run_id, "success", listed=listed, indexed=indexed)
         # 兜底通道：保留 sync_state.json 写入（status 兼容回退）
         cov = results.get("coverage", 1)
         state_steps = {k: v for k, v in results.items() if k != "coverage"}
         write_sync_state(cfg, state_steps, cov, dur)
+        # P1-1：成功但索引有缺口 → 警告级告警（不算失败，但要让人知道）
+        if cov and not (error_msg or bad):
+            from .notify import notify
+            notify(cfg, "coverage_gap", "索引覆盖不全",
+                   "部分笔记未进索引（见日志），可跑 python -m xhs_rag.cli index 补建",
+                   level="warning")
         logger.success(
             f"===== M7 sync 结束, 耗时 {dur:.0f}s, "
             f"各环节: {results}, 异常环节: {bad or '无'} ====="
@@ -751,6 +816,18 @@ def cmd_schedule(cfg: Config, action: str, at: str = "09:00") -> int:
                     print(f"  错误: {st['error_msg']}")
         else:
             print("上次同步: 无记录（尚未跑过 sync 或状态文件缺失）")
+        # P1-1：把未读告警带出来，让"失败可观测"闭环无需打开 Web
+        try:
+            from . import notify as _n
+            un = _n.unacked_count(cfg)
+            if un:
+                print(f"\n⚠️  未读告警 {un} 条（最近 3 条）：")
+                for a in _n.recent(cfg, 3, only_unacked=True):
+                    print(f"  [{a['ts']}] {a['title']} —— {a['message']}")
+                print("  查看全部: python -m xhs_rag.cli alerts list"
+                      "  标记已读: python -m xhs_rag.cli alerts ack")
+        except Exception:
+            pass
         return 0
 
     if action == "run":
@@ -771,6 +848,33 @@ def cmd_schedule(cfg: Config, action: str, at: str = "09:00") -> int:
         return cmd_sync(cfg)
 
     print(f"未知 schedule 动作: {action}")
+    return 1
+
+
+# ── alerts（P1-1 失败告警）───────────────────────────────
+def cmd_alerts(cfg: Config, action: str, limit: int = 20) -> int:
+    """list / ack。告警来源：同步失败、登录态失效、索引覆盖缺口。"""
+    from . import notify as _n
+
+    if action == "list":
+        items = _n.recent(cfg, limit)
+        if not items:
+            print("无告警记录（好事）")
+            return 0
+        un = _n.unacked_count(cfg)
+        print(f"===== 告警 {len(items)} 条（全库未读 {un} 条）=====")
+        for a in items:
+            mark = "●" if not a.get("ack") else "○"
+            lvl = "ERR " if a.get("level") == "error" else "WARN"
+            print(f"{mark} [{a['ts']}] {lvl} {a['title']} —— {a['message']}")
+        return 0
+
+    if action == "ack":
+        n = _n.ack_all(cfg)
+        print(f"已标记 {n} 条告警为已读")
+        return 0
+
+    print(f"未知 alerts 动作: {action}（可用: list / ack）")
     return 1
 
 
@@ -802,12 +906,16 @@ def main(argv: list[str] | None = None) -> int:
     p_index = sub.add_parser("index", help="向量化 Markdown 建索引（M5）")
     p_index.add_argument("--force", action="store_true", help="重建索引表")
     p_index.add_argument("--limit", type=int, help="只索引前 N 篇")
-    p_search = sub.add_parser("search", help="语义检索（M5）")
-    p_search.add_argument("query", help="检索关键词/问题")
+    p_search = sub.add_parser("search", help="语义检索（M5，--image 可传截图）")
+    p_search.add_argument("query", nargs="?", default="",
+                          help="检索关键词/问题（用 --image 时可省略）")
     p_search.add_argument("-k", type=int, default=5, help="返回条数")
-    p_ask = sub.add_parser("ask", help="检索 + LLM 带引用回答（M8）")
-    p_ask.add_argument("query", help="问题")
+    p_search.add_argument("--image", help="截图路径：OCR 成检索词后合并检索（查询端多模态）")
+    p_ask = sub.add_parser("ask", help="检索 + LLM 带引用回答（M8，--image 可传截图）")
+    p_ask.add_argument("query", nargs="?", default="",
+                       help="问题（用 --image 时可省略）")
     p_ask.add_argument("-k", type=int, default=5, help="喂给 LLM 的片段数")
+    p_ask.add_argument("--image", help="截图路径：OCR 后与问题合并（查询端多模态）")
     p_sync = sub.add_parser("sync", help="一键全量同步（M7：collect→detail→ocr→video→index）")
     p_sync.add_argument("--headless", action="store_true", help="无头模式（定时任务用，风控更严）")
     p_sync.add_argument("--max-pages", type=int, default=50, help="收藏列表翻页上限")
@@ -841,6 +949,12 @@ def main(argv: list[str] | None = None) -> int:
     p_sched_sub.add_parser("status", help="查看任务注册状态与上次同步结果")
     p_sched_sub.add_parser("run", help="立即触发一次（已注册走系统调度，未注册前台直跑）")
 
+    p_alerts = sub.add_parser("alerts", help="失败告警（P1-1）：list 查看 / ack 全部标记已读")
+    p_alerts_sub = p_alerts.add_subparsers(dest="alerts_action", required=True)
+    p_alerts_l = p_alerts_sub.add_parser("list", help="列出最近告警")
+    p_alerts_l.add_argument("--limit", type=int, default=20, help="最多显示条数")
+    p_alerts_sub.add_parser("ack", help="全部标记已读")
+
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
     _setup(cfg, "DEBUG" if args.verbose else "INFO")
@@ -865,9 +979,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "index":
         return cmd_index(cfg, force=args.force, limit=args.limit)
     if args.cmd == "search":
-        return cmd_search(cfg, args.query, k=args.k)
+        return cmd_search(cfg, args.query, k=args.k, image=args.image)
     if args.cmd == "ask":
-        return cmd_ask(cfg, args.query, k=args.k)
+        return cmd_ask(cfg, args.query, k=args.k, image=args.image)
     if args.cmd == "agent":
         return cmd_agent(cfg, args.query, max_steps=args.max_steps)
     if args.cmd == "sync":
@@ -886,6 +1000,9 @@ def main(argv: list[str] | None = None) -> int:
                           yes=getattr(args, "yes", False))
     if args.cmd == "schedule":
         return cmd_schedule(cfg, args.sched_action, at=getattr(args, "at", "09:00"))
+    if args.cmd == "alerts":
+        return cmd_alerts(cfg, args.alerts_action,
+                          limit=getattr(args, "limit", 20))
     if args.cmd == "mcp":
         from .mcp_server import main as mcp_main
 

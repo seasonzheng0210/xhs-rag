@@ -104,14 +104,48 @@ class RAGAgent:
     LLM_RETRIES = 2      # LLM 调用重试次数(退避 1s)
     TOOL_RETRIES = 1     # 工具失败重试次数
 
-    def __init__(self, cfg, verbose: bool = True, max_steps: int = 8):
+    def __init__(self, cfg, verbose: bool = True, max_steps: int = 8,
+                 session: str = ""):
         self.cfg = cfg
         self.verbose = verbose
         self.max_steps = max_steps
+        self.session = session  # M11 记忆采集标签(cli/mcp)；空=非用户会话，不落盘
         self._ctx: dict | None = None
         self._graph = None
         from .qa.answer import Answerer
         self._ans = Answerer(cfg)  # 只借 base_url/model/headers/_payload
+
+    # ── M11 长期记忆：背景注记注入 + 本轮对话采集 ────────────────
+    def _memory_note(self) -> str:
+        """取长期记忆背景注记（最近摘要 + 高频画像）。失败静默返回空串。
+
+        与 serve /api/answer 同一入口(memory.recent_context)，保证三条路径
+        (Web / Agent / MCP) 的记忆注入行为一致。
+        """
+        try:
+            from .memory import recent_context
+            return recent_context(str(self.cfg.path("paths.db")))
+        except Exception as e:
+            logger.warning(f"记忆背景注记读取失败(忽略): {e}")
+            return ""
+
+    def _log_dialog(self, role: str, content: str) -> None:
+        """本轮对话原文落盘（零 LLM 成本，离线 digest 消费）。失败静默。
+
+        ⚠️ **session 为空 = 非用户会话，一律不落盘**。脚本/评测（如
+        scripts/test_agent_cases.py）实例化 RAGAgent 时不传 session，
+        若照样写库，离线 digest 会把测试用例当用户对话摘要进长期记忆
+        —— 污染真实记忆。CLI 入口显式传 session="cli"，MCP 传 "mcp"。
+        """
+        if not self.session:
+            return
+        if not (content or "").strip():
+            return
+        try:
+            from .memory import log_dialog
+            log_dialog(str(self.cfg.path("paths.db")), role, content, self.session)
+        except Exception as e:
+            logger.warning(f"对话落盘失败(忽略): {e}")
 
     # ── ctx：复用 mcp_server 的构建与预热（主线程调用，无 Windows 死锁问题）──
     def _get_ctx(self) -> dict:
@@ -153,7 +187,9 @@ class RAGAgent:
 
     def _tool_ask(self, query: str) -> str:
         from .mcp_server import _tool_ask
-        return _tool_ask(query)
+        # record 跟随父会话：脚本/评测（session 空）时 ask 子调用也不写记忆，
+        # 否则 _tool_ask 会以 session="mcp" 把测试问答写进真实 dialog_log。
+        return _tool_ask(query, record=bool(self.session))
 
     def _tool_read_note(self, note_id: str) -> str:
         ctx = self._get_ctx()
@@ -326,9 +362,16 @@ class RAGAgent:
     def run(self, query: str) -> dict:
         """跑一个决策循环，返回 {answer, steps, tool_calls, secs[, hit_limit]}。"""
         t0 = time.time()
+        # M11: 记忆背景注记作为第二条 system 消息注入(空则不加)，放在
+        # 决策循环最前面 → 后续每轮 _chat 都带着它，无需逐节点重复拼。
+        msgs: list[dict] = [{"role": "system", "content": AGENT_SYSTEM}]
+        note = self._memory_note()
+        if note:
+            msgs.append({"role": "system", "content": note})
+        msgs.append({"role": "user", "content": query})
+        self._log_dialog("user", query)
         init: AgentState = {
-            "messages": [{"role": "system", "content": AGENT_SYSTEM},
-                         {"role": "user", "content": query}],
+            "messages": msgs,
             "pending": [], "trace": [], "steps": 0,
             "answer": "", "hit_limit": False,
         }
@@ -341,6 +384,7 @@ class RAGAgent:
                 if m.get("role") == "assistant" and (m.get("content") or "").strip():
                     answer = m["content"].strip()
                     break
+        self._log_dialog("assistant", answer)
         out = {"answer": answer, "steps": final["steps"],
                "tool_calls": final["trace"],
                "secs": round(time.time() - t0, 1)}

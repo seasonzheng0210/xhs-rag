@@ -96,10 +96,39 @@ sup.cite:hover{background:var(--accent);color:#fff}
   border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;
   vertical-align:-2px;margin-right:6px}
 @keyframes sp{to{transform:rotate(360deg)}}
+/* ── P1-1 告警横幅 ── */
+#alertbar:empty{display:none}
+.alert{background:#fef2f2;border:1px solid #fca5a5;color:#7f1d1d;
+  padding:10px 12px;border-radius:10px;margin:10px 0;font-size:13px}
+.alert .hd{font-weight:600;margin-bottom:6px;display:flex;
+  justify-content:space-between;align-items:center;gap:8px}
+.alert .hd button{background:#b91c1c;color:#fff;border:0;border-radius:6px;
+  padding:3px 9px;font-size:12px;cursor:pointer;white-space:nowrap}
+.alert .item{padding:4px 0;border-top:1px dashed #fca5a5}
+.alert .item .ts{color:#9a3412;font-size:11px;margin-right:6px}
+/* ── P1-2 同步健康面板 ── */
+.syncpanel{margin:16px 0 4px;font-size:13px}
+.syncpanel .hd{display:flex;justify-content:space-between;align-items:center;
+  cursor:pointer;padding:8px 10px;background:#f8fafc;border:1px solid #e2e8f0;
+  border-radius:10px;font-weight:600}
+.syncpanel .hd .meta{font-weight:400;color:#64748b;font-size:12px}
+.syncpanel .body{border:1px solid #e2e8f0;border-top:0;border-radius:0 0 10px 10px;
+  padding:8px 10px;display:none;background:#fff}
+.syncpanel.open .body{display:block}
+.syncpanel table{width:100%;border-collapse:collapse;font-size:12px}
+.syncpanel th{text-align:left;color:#64748b;font-weight:500;padding:4px 6px;
+  border-bottom:1px solid #e2e8f0;white-space:nowrap}
+.syncpanel td{padding:5px 6px;border-bottom:1px solid #f1f5f9;
+  font-variant-numeric:tabular-nums}
+.syncpanel tr.fail td{background:#fef2f2}
+.syncpanel tr.run td{background:#fffbeb}
+.syncpanel .ok{color:#15803d}.syncpanel .bad{color:#b91c1c}
+.syncpanel .warn{color:#b45309}
 </style>
 </head>
 <body>
 <header><h1>📚 收藏夹 RAG</h1><span class="sub" id="stat"></span></header>
+<div id="alertbar"></div>
 <div class="searchbox">
   <input id="q" placeholder="搜收藏夹里的内容…" autocomplete="off">
   <button id="btn" onclick="go()">搜索</button>
@@ -108,6 +137,12 @@ sup.cite:hover{background:var(--accent);color:#fff}
 <div id="status"></div>
 <div id="answer-box"></div>
 <div id="results"></div>
+<div class="syncpanel" id="syncpanel">
+  <div class="hd" onclick="this.parentNode.classList.toggle('open');loadSync()">
+    <span>🔄 同步健康</span><span class="meta" id="syncmeta">点击展开</span>
+  </div>
+  <div class="body" id="syncbody"></div>
+</div>
 <div class="footer" id="foot"></div>
 <script>
 let loading=false;
@@ -243,9 +278,53 @@ document.addEventListener('click',e=>{
 });
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 $('#q').addEventListener('keydown',e=>{if(e.key==='Enter')go()});
+/* ── P1-1 告警横幅：未读告警置顶显示，可一键标记已读 ── */
+async function loadAlerts(){
+  try{
+    const r=await fetch('/api/alerts');const d=await r.json();
+    const bar=$('#alertbar');
+    if(!d.unacked){bar.innerHTML='';return}
+    let h='<div class="alert"><div class="hd"><span>⚠️ 有 '+d.unacked+' 条未读告警</span>'+
+      '<button onclick="ackAlerts()">全部标记已读</button></div>';
+    d.items.forEach(a=>{h+='<div class="item"><span class="ts">'+esc(a.ts)+'</span>'+
+      '<b>'+esc(a.title)+'</b> —— '+esc(a.message)+'</div>'});
+    bar.innerHTML=h+'</div>';
+  }catch(e){}
+}
+async function ackAlerts(){
+  try{await fetch('/api/alerts?ack=1');loadAlerts()}catch(e){}
+}
+/* ── P1-2 同步健康面板：读 sync_runs 最近 N 轮 ── */
+let syncLoaded=false;
+async function loadSync(){
+  if(syncLoaded)return;syncLoaded=true;
+  const body=$('#syncbody');
+  try{
+    const r=await fetch('/api/sync');const d=await r.json();
+    $('#syncmeta').textContent=d.runs.length?('最近 '+d.runs.length+' 轮 · 失败 '+d.failed)+' 轮':'暂无记录';
+    if(!d.runs.length){body.innerHTML='<div style="color:#64748b">还没有同步记录</div>';return}
+    let h='<table><tr><th>开始时间</th><th>触发</th><th>状态</th><th>耗时</th><th>listed</th><th>indexed</th><th>说明</th></tr>';
+    d.runs.forEach(r=>{
+      const cls=r.status==='failed'?'fail':(r.status==='running'?'run':'');
+      const st=r.status==='success'?'<span class="ok">成功</span>':
+        (r.status==='running'?'<span class="warn">运行中</span>':'<span class="bad">失败</span>');
+      h+='<tr class="'+cls+'"><td>'+esc(r.started||'')+'</td><td>'+esc(r.trigger||'')+'</td>'+
+        '<td>'+st+'</td><td>'+(r.duration_s==null?'-':r.duration_s+'s')+'</td>'+
+        '<td>'+(r.listed||0)+'</td><td>'+(r.indexed||0)+'</td>'+
+        '<td>'+esc(r.error_msg||'')+'</td></tr>';
+    });
+    body.innerHTML=h+'</table>';
+  }catch(e){body.innerHTML='<div style="color:#b91c1c">同步记录读取失败</div>'}
+}
 (async()=>{try{const r=await fetch('/api/stats');const d=await r.json();
   $('#stat').textContent='共 '+d.notes+' 篇 · '+d.chunks+' chunks';
   $('#foot').textContent='笔记 '+d.notes+' · 图片 OCR '+d.images+' · 视频 '+d.videos+' · 转写 '+d.asr_chars+' 字';
+}catch(e){}})();
+loadAlerts();
+/* 有失败轮次时自动展开同步健康面板，省得用户自己找 */
+(async()=>{try{
+  const r=await fetch('/api/sync');const d=await r.json();
+  if(d.failed>0||d.running>0){document.getElementById('syncpanel').classList.add('open');loadSync()}
 }catch(e){}})();
 </script>
 </body>
@@ -272,6 +351,7 @@ class Handler(BaseHTTPRequestHandler):
     db: DB = None
     started_at: float = time.time()
     db_path: str = ""
+    cfg: object = None  # P1-1/P1-2: 告警与同步健康需要读配置
     answerer = None  # qa.Answerer，未配置则 None
     debug: bool = False  # 调试模式: 错误响应携带完整 traceback, 前端可查看/复制/跳 WorkBuddy
     # 多轮对话会话存储: sid -> [{role, content}] (扁平 messages, 最新在后)
@@ -444,6 +524,23 @@ class Handler(BaseHTTPRequestHandler):
                 "debug": bool(getattr(self, "debug", False)),
                 "uptime_secs": round(time.time() - self.started_at),
             })
+        elif url.path == "/api/sync":
+            # P1-2: 同步健康（读 sync_runs 最近 N 轮）。不触发模型推理。
+            try:
+                self._json(self._sync_health())
+            except Exception as e:
+                self._json({"error": f"sync: {e}"}, 500)
+        elif url.path == "/api/alerts":
+            # P1-1: 告警查询；带 ?ack=1 则全部标记已读
+            try:
+                from .. import notify as _n
+                if parse_qs(url.query).get("ack"):
+                    self._json({"acked": _n.ack_all(self.cfg)})
+                    return
+                self._json({"unacked": _n.unacked_count(self.cfg),
+                            "items": _n.recent(self.cfg, 10)})
+            except Exception as e:
+                self._json({"error": f"alerts: {e}"}, 500)
         else:
             # HTTP/1.1 下必须给 Content-Length，否则客户端会一直等 body
             self.send_response(404)
@@ -575,6 +672,57 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _sync_health(self, limit: int = 10) -> dict:
+        """P1-2: 读 sync_runs 最近 N 轮（纯 DB 读，无模型推理，秒回）。"""
+        from datetime import datetime
+
+        runs: list[dict] = []
+        if self.db_path:
+            conn = None
+            try:
+                # ⚠️ 必须走 _db_conn(): 本模块没有模块级 import sqlite3
+                # (历史原因, 各处按需局部导入)。2026-09-16 冒烟抓到过
+                # 这里直接写 sqlite3.connect 导致 NameError 被 except 吞掉,
+                # 接口静默返回空列表 —— 面板永远显示"无记录"。
+                conn = self._db_conn()
+                cur = conn.execute(
+                    "SELECT run_id, started_at, finished_at, trigger, status, "
+                    "listed, indexed, error_msg FROM sync_runs "
+                    "ORDER BY started_at DESC LIMIT ?", (limit,))
+                for r in cur.fetchall():
+                    d = dict(r)
+                    st, fi = d.get("started_at"), d.get("finished_at")
+                    status = d.get("status") or ""
+                    # 僵尸运行态归一：正常一次同步是分钟级，超 6h 还挂 running
+                    # 的必然是被杀/崩溃遗留（DB 侧下次 start_run 会正式收尸，
+                    # 这里先保证面板不说谎）。2026-09-16 实测库里积了 3 条，
+                    # 其中一条 392 小时，面板当时谎报"2 轮在运行中"。
+                    if (status == "running" and st
+                            and (time.time() * 1000 - st) > 6 * 3600 * 1000):
+                        status = "aborted"
+                    runs.append({
+                        "run_id": (d.get("run_id") or "")[:8],
+                        "started": (datetime.fromtimestamp(st / 1000)
+                                    .strftime("%m-%d %H:%M") if st else ""),
+                        "trigger": d.get("trigger") or "",
+                        "status": status,
+                        "duration_s": (round((fi - st) / 1000, 1)
+                                       if (st and fi) else None),
+                        "listed": d.get("listed") or 0,
+                        "indexed": d.get("indexed") or 0,
+                        "error_msg": (d.get("error_msg") or "")[:80],
+                    })
+            except Exception as e:
+                logger.warning(f"同步健康读取失败: {e}")
+            finally:
+                if conn is not None:
+                    conn.close()
+        return {
+            "runs": runs,
+            "failed": sum(1 for r in runs if r["status"] == "failed"),
+            "running": sum(1 for r in runs if r["status"] == "running"),
+        }
+
     def _stats(self) -> dict:
         if not self.db_path:
             return {"notes": 0, "images": 0, "videos": 0, "asr_chars": 0, "chunks": 0}
@@ -649,6 +797,7 @@ def serve(cfg: Config) -> int:
     Handler.retriever = retriever
     Handler.db = db
     Handler.db_path = str(cfg.path("paths.db"))
+    Handler.cfg = cfg  # P1-1/P1-2
     Handler.answerer = _build_answerer(cfg)
     Handler.debug = bool(cfg.get("serve.debug", False))  # 调试模式(错误详情+跳转修复)
     Handler.debug_dir = str(cfg.path("paths.data_dir") / "debug")  # 错误报告落盘目录
