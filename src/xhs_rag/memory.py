@@ -405,7 +405,19 @@ def run_digest(db_path: str, answerer, max_blocks: int = 6,
             total["rounds"] += r["rounds"]
             total["summaries"] += r["summary"]
             total["profiles"] += r["profiles"]
-            mark_digested(db_path, b["ids"])
+            # ★ 2026-09-30 修：只有真的产出过东西才 mark_digested。
+            #   内层对「摘要」「画像」两趟 LLM 各自 try/except 跳过，异常**不会**
+            #   冒到这里 —— 所以下面那个 except 只挡得住非 LLM 类错误。此前只靠
+            #   它判断失败，导致 LLM 整体不可用（网络抖动 / 429 / key 失效）时
+            #   errors 仍报 0、轮次照常被标记已消化 → **对话永久丢失、无法重试**。
+            #   现在改用「产出为零」作失败信号：一块既无摘要又无画像 = 白跑一趟，
+            #   保留待消化，下次（LLM 恢复后）重试。
+            if r["summary"] == 0 and r["profiles"] == 0:
+                total["errors"] += 1
+                logger.warning(
+                    f"块 {i} 无任何产出（LLM 不可用或返回为空），保留待重试")
+            else:
+                mark_digested(db_path, b["ids"])
         except Exception as e:
             logger.warning(f"块 {i} digest 失败: {e}")
             total["errors"] += 1  # 不 mark，下次重试
