@@ -24,7 +24,7 @@ class Indexer:
         self.lance_dir = cfg.path("paths.data_dir") / "lancedb"
         self.table_name = cfg.get("vectorstore.table_name", "xhs_notes")
         self.chunker = Chunker(cfg)
-        self.embedder = LocalEmbedder(cfg)
+        self.embedder = LocalEmbedder(cfg, purpose="index")
         self._db = None
 
     def _connect(self):
@@ -123,8 +123,10 @@ class Indexer:
             return {"md": len(mds), "chunks": 0, "skip_md": len(indexed),
                     "pruned": pruned}
 
-        # 分批编码(避免一次吃太多内存)
-        batch_size = int(self.cfg.get("embedding.local.batch_size", 8))
+        # 分批编码(避免一次吃太多内存)。batch_size 由 embedder 按设备决定
+        # (CUDA 默认 32 / CPU 默认 8),这里必须跟它取同一个值,否则外层分批
+        # 与内层 batch 不一致会让进度日志失真
+        batch_size = self.embedder.batch_size
         rows = []
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i: i + batch_size]

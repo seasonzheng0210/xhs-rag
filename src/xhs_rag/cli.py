@@ -454,35 +454,14 @@ def cmd_agent(cfg: Config, query: str, max_steps: int = 8) -> int:
 def _ocr_query(cfg: Config, image: str) -> str | None:
     """P2-3 查询端多模态：把用户给的截图 OCR 成检索词。
 
-    复用采集侧同一套 OcrEngine（本地 RapidOCR 优先，命中 escalate 条件
-    才上云 VLM 兜底），因此不需要任何新依赖。
-    在 CLI 主线程里加载 OCR 模型——避开 Windows 工作线程里首次加载
-    推理引擎死等的坑（同 mcp_server 顶部的说明）。
-    返回压平后的检索词；无文字/失败返回 None。
+    实际逻辑已抽到 `process.ocr.ocr_image_to_query` —— Web 上传与 MCP 的
+    image 参数共用同一份实现，这里只做 CLI 侧的返回值适配。
+    在 CLI 主线程里执行：避开 Windows 工作线程首次加载推理引擎死等的坑。
     """
-    from .process.ocr import OcrEngine
+    from .process.ocr import ocr_image_to_query
 
-    p = Path(image).expanduser()
-    if not p.exists():
-        logger.error(f"图片不存在：{p}")
-        return None
-    t0 = time.time()
-    try:
-        res = OcrEngine(cfg).ocr_image(p)
-    except Exception as e:
-        logger.error(f"图片 OCR 失败：{e}")
-        return None
-    text = (res or {}).get("text") or ""
-    # OCR 是多行的，检索词要压成单行并去掉过短的噪声行
-    lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) >= 2]
-    query = " ".join(lines).strip()[:300]
-    if not query:
-        logger.warning(f"图片没识别出可用文字：{p.name}")
-        return None
-    logger.info(f"图片检索词（{res.get('engine')} / conf="
-                f"{res.get('confidence', 0):.2f} / {time.time() - t0:.1f}s）："
-                f"{query[:80]}")
-    return query
+    info = ocr_image_to_query(cfg, image)
+    return info["text"] if info else None
 
 
 def cmd_search(cfg: Config, query: str, k: int = 5,

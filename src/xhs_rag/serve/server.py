@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import socket
 import threading
@@ -47,6 +48,29 @@ header .sub{font-size:12px;color:var(--muted)}
 #btn{padding:12px 20px;font-size:15px;font-weight:600;border:none;
   background:var(--accent);color:#fff;border-radius:var(--radius);cursor:pointer}
 #btn:disabled{opacity:.5}
+/* ── P2-3 Web 端传图检索 ── */
+.imgbtn{flex:0 0 auto;display:flex;align-items:center;justify-content:center;
+  width:46px;font-size:19px;border:1px solid var(--border);border-radius:var(--radius);
+  background:var(--card);cursor:pointer;user-select:none}
+.imgbtn:hover{border-color:var(--accent)}
+.imgbtn.busy{opacity:.5;pointer-events:none}
+#imgfile{display:none}
+.preview{position:relative;display:inline-block;margin-bottom:10px}
+.preview img{max-height:110px;max-width:100%;border-radius:10px;
+  border:1px solid var(--border);display:block}
+.preview .x{position:absolute;top:-8px;right:-8px;width:22px;height:22px;
+  border-radius:50%;background:#1f2328;color:#fff;border:none;cursor:pointer;
+  font-size:12px;line-height:1;padding:0}
+/* ── M10 Agent 深度思考开关 ── */
+.deeprow{display:flex;align-items:center;gap:8px;font-size:12px;
+  color:var(--muted);margin:-6px 0 12px}
+.deeprow label{display:flex;align-items:center;gap:6px;cursor:pointer}
+.deeprow input{width:15px;height:15px;accent-color:var(--accent);cursor:pointer}
+/* Agent 中间步骤进度 */
+.steps{background:#f8f8f6;border:1px solid var(--border);border-radius:10px;
+  padding:8px 12px;margin-bottom:12px;font-size:12px;color:#555}
+.steps .st{padding:2px 0;line-height:1.6}
+.steps .st b{color:var(--accent);font-weight:600}
 .hint{font-size:12px;color:var(--muted);margin-bottom:14px}
 #status{font-size:13px;color:var(--muted);margin-bottom:10px;min-height:18px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
@@ -131,7 +155,14 @@ sup.cite:hover{background:var(--accent);color:#fff}
 <div id="alertbar"></div>
 <div class="searchbox">
   <input id="q" placeholder="搜收藏夹里的内容…" autocomplete="off">
+  <label class="imgbtn" for="imgfile" id="imgbtn" title="上传截图：识别图中文字后检索">📷</label>
+  <input type="file" id="imgfile" accept="image/*" onchange="pickImage(this)">
   <button id="btn" onclick="go()">搜索</button>
+</div>
+<div id="preview"></div>
+<div class="deeprow">
+  <label><input type="checkbox" id="deep"> 深度思考</label>
+  <span>Agent 多步检索，更准但慢 3-5 倍</span>
 </div>
 <div class="hint">试试：怎么护理宝宝私处 / 衣物清洗 / 月子喂养</div>
 <div id="status"></div>
@@ -147,18 +178,60 @@ sup.cite:hover{background:var(--accent);color:#fff}
 <script>
 let loading=false;
 const $=s=>document.querySelector(s);
+/* ── P2-3 传图检索：前端先压到 ≤1600px JPEG 再传 ──
+   手机原图常 5MB+，base64 后约 6.7MB，既慢又可能触发体积限制；
+   压到 1600px/0.85 后通常 <600KB，OCR 精度基本无损。 */
+function shrink(file,maxSide,quality){
+  return new Promise((res,rej)=>{
+    const img=new Image(),url=URL.createObjectURL(file);
+    img.onload=()=>{
+      const w=img.naturalWidth,h=img.naturalHeight;
+      const s=Math.min(1,maxSide/Math.max(w,h));
+      const c=document.createElement('canvas');
+      c.width=Math.round(w*s);c.height=Math.round(h*s);
+      c.getContext('2d').drawImage(img,0,0,c.width,c.height);
+      URL.revokeObjectURL(url);
+      res(c.toDataURL('image/jpeg',quality));
+    };
+    img.onerror=()=>{URL.revokeObjectURL(url);rej(new Error('图片读取失败'))};
+    img.src=url;
+  });
+}
+async function pickImage(inp){
+  const f=inp.files&&inp.files[0];if(!f)return;
+  const btn=$('#imgbtn');btn.classList.add('busy');
+  $('#status').innerHTML='<span class="spin"></span>识别图片文字…';
+  try{
+    const dataUrl=await shrink(f,1600,0.85);
+    const r=await fetch('/api/ocr',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({image:dataUrl})});
+    const d=await r.json();
+    if(d.error){showError('图片识别失败：'+d.error,d.trace,null);return}
+    if(!d.text){$('#status').textContent='图片里没识别出文字，换个更清晰的截图';return}
+    $('#q').value=(($('#q').value.trim()+' '+d.text).trim()).slice(0,300);
+    $('#preview').innerHTML='<div class="preview"><img src="'+dataUrl+'">'+
+      '<button class="x" onclick="clearImage()">×</button></div>';
+    $('#status').textContent='已识别（'+d.engine+' · '+d.secs+'s），可直接搜索';
+  }catch(e){showError('图片上传失败：'+e,null,null)}
+  finally{btn.classList.remove('busy');inp.value=''}
+}
+function clearImage(){$('#preview').innerHTML='';$('#status').textContent=''}
 async function go(){
   const q=$('#q').value.trim();
   if(!q||loading)return;
+  const deep=$('#deep').checked;
   loading=true;$('#btn').disabled=true;
-  $('#status').innerHTML='<span class="spin"></span>检索中…';
+  $('#status').innerHTML='<span class="spin"></span>'+(deep?'Agent 多步检索中…':'检索中…');
   $('#results').innerHTML='';$('#answer-box').innerHTML='';
   const t0=Date.now();
   try{
     // 一次性流式接口：先推检索结果，再逐字推 LLM 回答
+    // 深度思考: 走 /api/agent(LangGraph 多步循环)，事件协议与 /api/answer
+    //           兼容(meta/delta/notice/done/error)，额外有 step 事件报中间步骤
     // 多轮: sid 存 localStorage,同会话追问服务端自动结合历史改写检索词
     if(!localStorage.xhsSid)localStorage.xhsSid=crypto.randomUUID();
-    const resp=await fetch('/api/answer?q='+encodeURIComponent(q)
+    const resp=await fetch((deep?'/api/agent':'/api/answer')+'?q='+encodeURIComponent(q)
       +'&sid='+encodeURIComponent(localStorage.xhsSid));
     const reader=resp.body.getReader(),dec=new TextDecoder();
     let buf='';
@@ -170,7 +243,17 @@ async function go(){
       for(const ln of lines){
         if(!ln.startsWith('data: '))continue;
         let d;try{d=JSON.parse(ln.slice(6))}catch(e){continue}
-        if(d.type==='meta'){
+        if(d.type==='step'){
+          // Agent 模式专有：逐节点报进度，避免用户对着白屏等 30-60 秒
+          let s=$('#answer-box .steps');
+          if(!s){$('#answer-box').innerHTML='<div class="steps"></div>';
+            s=$('#answer-box .steps')}
+          const line=document.createElement('div');line.className='st';
+          line.innerHTML=d.detail||('第 '+d.steps+' 步');
+          s.appendChild(line);
+          $('#status').textContent='Agent 执行中（第 '+d.steps+' 步 / 上限 '
+            +(d.max_steps||8)+'）…';
+        }else if(d.type==='meta'){
           $('#status').textContent='检索到 '+d.results.length+' 条，正在生成回答…';
           if(d.rewritten)$('#status').innerHTML=
             '<span class="spin"></span>按「'+d.rewritten+'」检索到 '+
@@ -195,8 +278,13 @@ async function go(){
           const b=$('#answer-box .body');
           if(b)b.innerHTML=withCites(b.textContent);
           const secs=((Date.now()-t0)/1000).toFixed(1);
-          $('#status').textContent='共耗时 '+secs+' 秒（检索 '+d.search_secs
-            +' 秒 + 生成 '+d.llm_secs+' 秒）';
+          if(d.steps!=null){  // Agent 模式: 报步数与工具调用次数
+            $('#status').textContent='共耗时 '+secs+' 秒（Agent '+d.steps+' 步 · '
+              +((d.tools||[]).length)+' 次工具调用）';
+          }else{
+            $('#status').textContent='共耗时 '+secs+' 秒（检索 '+d.search_secs
+              +' 秒 + 生成 '+d.llm_secs+' 秒）';
+          }
         }
       }
     }
@@ -359,6 +447,10 @@ class Handler(BaseHTTPRequestHandler):
     sessions: dict = {}
     SESSION_TTL = 1800
     SESSION_MAX_ROUNDS = 6
+    # Web 传图体积上限。前端已把手机原图压到 ≤1600px/JPEG(~600KB)，
+    # 8MB 是给"绕过前端压缩的直传"留的余量；超过直接拒，不读进内存。
+    MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+    ocr_ok: bool = False  # serve() 启动时主线程预热 OCR 的结果
 
     def _db_conn(self):
         """每请求新建 sqlite 连接(sqlite 连接不能跨线程)。"""
@@ -475,6 +567,63 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        """POST 端点：目前只有 /api/ocr（图片上传）。
+
+        /api/search 与 /api/answer 保持 GET（query 短，走 URL 更省事）；
+        图片体积大必须走 body，故单独开一个 POST 端点。
+        """
+        url = urlparse(self.path)
+        if url.path == "/api/ocr":
+            self._handle_ocr(url)
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    def _handle_ocr(self, url):
+        """P2-3 查询端多模态(Web 侧)：把上传的截图 OCR 成检索词。
+
+        与 CLI 的 `--image` 复用同一套 OcrEngine，不需要任何新依赖。
+
+        ⚠️ OcrEngine 的模型必须在 serve 启动时于**主线程**预热（见 serve()）：
+        Windows 上在工作线程里首次加载推理引擎会死等挂起，而 HTTP handler
+        恰好跑在 ThreadingHTTPServer 的 worker 线程里。这里只做推理，不加载。
+        """
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0:
+                raise ValueError("空请求体")
+            if n > self.MAX_UPLOAD_BYTES:
+                raise ValueError(
+                    f"图片过大({n / 1048576:.1f}MB)，上限 "
+                    f"{self.MAX_UPLOAD_BYTES // 1048576}MB")
+            obj = json.loads(self.rfile.read(n).decode("utf-8"))
+            data_url = str(obj.get("image") or "").strip()
+            if not data_url.startswith("data:image/"):
+                raise ValueError("image 需为 data:image/* 形式的数据 URL")
+            t0 = time.time()
+            # 直接复用查询端统一实现：它已经处理了 data URL 解码、临时文件
+            # 落盘与清理、多行压平、300 字截断 —— 这里不再重复一遍。
+            # 引擎是进程级共享实例，所以每张图不会重付 RapidOCR 加载开销。
+            from ..process.ocr import ocr_image_to_query
+
+            info = ocr_image_to_query(self.cfg, data_url)
+            query = (info or {}).get("text") or ""
+            if not query:
+                logger.warning("上传图片没识别出可用文字")
+            b64 = data_url.split(",", 1)[1] if "," in data_url else ""
+            self._json({
+                "text": query,
+                "engine": (info or {}).get("engine", ""),
+                "confidence": round(float((info or {}).get("confidence") or 0), 2),
+                "bytes": len(b64) * 3 // 4,   # base64 → 原始字节数（估算）
+                "secs": round(time.time() - t0, 1),
+            })
+        except Exception as e:
+            logger.exception("图片 OCR 失败")
+            self._json(self._err_body("图片识别失败", e), 400)
+
     def do_GET(self):
         url = urlparse(self.path)
         if url.path == "/" or url.path == "/index.html":
@@ -494,6 +643,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(self._err_body("搜索失败", e), 500)
         elif url.path == "/api/answer":
             self._handle_answer(url)
+        elif url.path == "/api/agent":
+            self._handle_agent(url)
         elif url.path == "/api/stats":
             self._json(self._stats())
         elif url.path == "/api/memory":
@@ -546,6 +697,80 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
+
+    def _handle_agent(self, url):
+        """M10 Agent 多步问答（SSE）。
+
+        与 /api/answer（单跳：检索 → 生成）的区别：走 LangGraph 决策循环，
+        4 个只读工具、最多 8 步、步数耗尽有 finalize 兜底。
+
+        事件协议与 /api/answer 保持兼容（meta/delta/notice/done/error），
+        额外增加 step 事件报告中间步骤 —— 否则用户要对着白屏等 30-60 秒。
+        记忆落盘由 RAGAgent 内部按 session 处理，这里不重复写。
+        """
+        q = (parse_qs(url.query).get("q") or [""])[0].strip()
+        sid = (parse_qs(url.query).get("sid") or [""])[0].strip()
+        if not q:
+            self._json({"error": "缺少 q 参数"}, 400)
+            return
+
+        self._sse_head()
+        try:
+            from ..agent import RAGAgent
+
+            agent = RAGAgent(self.cfg, verbose=False,
+                             session=f"web:{sid}" if sid else "web")
+            hits: list[dict] = []
+            out: dict = {}
+            for kind, payload in agent.stream(q):
+                if kind == "step":
+                    self._sse({"type": "step", "max_steps": agent.max_steps,
+                               **payload})
+                    if payload.get("hits"):
+                        hits = payload["hits"]
+                elif kind == "final":
+                    out = payload
+
+            # 引用卡片：用 Agent 实际检索到的命中补全 url / note_type
+            if hits:
+                self._sse({"type": "meta", "q": q, "secs": out.get("secs", 0),
+                           "results": self._enrich(hits)})
+
+            answer = out.get("answer") or ""
+            if answer:
+                self._sse({"type": "delta", "text": answer,
+                           "model": getattr(self.answerer, "model", "")})
+                # 多轮: 写回会话（与 /api/answer 共用同一套 session 存储）
+                if sid:
+                    sess = self.sessions.setdefault(sid, [])
+                    sess.append({"role": "user", "content": q,
+                                 "_ts": time.time()})
+                    sess.append({"role": "assistant", "content": answer})
+                    keep = self.SESSION_MAX_ROUNDS * 2
+                    if len(sess) > keep:
+                        del sess[:-keep]
+            else:
+                self._sse({"type": "notice",
+                           "message": "Agent 没有产出回答（多半是收藏里没有相关内容）"})
+            self._sse({"type": "done", "steps": out.get("steps", 0),
+                       "tools": out.get("tool_calls", []),
+                       "search_secs": 0, "llm_secs": out.get("secs", 0)})
+        except Exception as e:  # 含客户端断开
+            logger.warning(f"Agent 问答失败: {e}")
+            try:
+                if self.debug:
+                    import traceback as _tb
+
+                    self._dump_error(self._report_text(q, e, self.path))
+                    self._sse({"type": "error", "message": f"Agent 失败：{e}",
+                               "trace": _tb.format_exc().splitlines(),
+                               "q": q, "path": self.path})
+                else:
+                    self._sse({"type": "notice", "message": f"Agent 失败：{e}"})
+                self._sse({"type": "done", "steps": 0, "tools": [],
+                           "search_secs": 0, "llm_secs": 0})
+            except Exception:
+                pass
 
     def _handle_answer(self, url):
         """检索 + LLM 问答，SSE 流式：
@@ -767,6 +992,28 @@ def _build_answerer(cfg: Config):
         return None
 
 
+def _warmup_ocr(cfg) -> bool:
+    """主线程预热 OCR 引擎（供 Web 传图检索）。失败只降级，不拖垮服务。
+
+    为什么必须在这里做：Windows 上在工作线程里首次加载推理引擎会死等挂起
+    （同 mcp_server 顶部说明），而 HTTP handler 跑在 ThreadingHTTPServer 的
+    worker 线程里 —— 若等首次传图才加载，那个请求会直接卡死。
+    """
+    try:
+        from ..process.ocr import shared_ocr_engine
+
+        t0 = time.time()
+        # 必须走共享实例：否则这里预热的对象会被丢掉，
+        # 而每次传图 ocr_image_to_query 又新建一个 → 预热白做、每张图重付加载。
+        ok = shared_ocr_engine(cfg).warmup()
+        logger.info(f"OCR 引擎预热{'完成' if ok else '失败(降级为云端 API)'}"
+                    f",耗时 {time.time() - t0:.0f}s")
+        return ok
+    except Exception as e:
+        logger.warning(f"OCR 预热异常，Web 传图将不可用：{e}")
+        return False
+
+
 def _startup_digest(cfg) -> None:
     """后台线程: 启动时消化一次未处理的对话记忆(digest)。
 
@@ -801,6 +1048,9 @@ def serve(cfg: Config) -> int:
     Handler.answerer = _build_answerer(cfg)
     Handler.debug = bool(cfg.get("serve.debug", False))  # 调试模式(错误详情+跳转修复)
     Handler.debug_dir = str(cfg.path("paths.data_dir") / "debug")  # 错误报告落盘目录
+
+    # ── P2-3: Web 传图检索的 OCR 引擎必须在主线程预热（见 _warmup_ocr）──
+    Handler.ocr_ok = _warmup_ocr(cfg)
 
     # ── M11: 启动后后台消化一次对话记忆(不阻塞 UI 启动/首问) ──
     if Handler.answerer is not None:

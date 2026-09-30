@@ -20,7 +20,7 @@ class Retriever:
     def __init__(self, cfg: Config, db=None):
         self.cfg = cfg
         self.db = db  # sqlite DB(取笔记链接用),可空
-        self.embedder = LocalEmbedder(cfg)
+        self.embedder = LocalEmbedder(cfg, purpose="query")
         self.lance_dir = cfg.path("paths.data_dir") / "lancedb"
         self.table_name = cfg.get("vectorstore.table_name", "xhs_notes")
         self.top_k_in = int(cfg.get("rerank.top_k_in", 50))
@@ -48,6 +48,21 @@ class Retriever:
         # (bge-reranker 分数 sigmoid 两极化: 相关 ~0.9+, 无关 ~1e-4 量级)
         self.crag_enabled = bool(cfg.get("retrieval.crag.enabled", True))
         self.crag_min_score = float(cfg.get("retrieval.crag.min_top1_score", 0.05))
+        # ★ 2026-09-30：rerank 关闭时的低置信判据 —— dense top1 的 LanceDB 距离。
+        # 关 rerank 后下游 score 是 RRF 分按 top1 归一化的结果（top1 恒等于 1.0），
+        # 只有相对序、没有绝对量纲，做不了阈值判断 —— 上一版因此让 CRAG 自评整体
+        # 失效（top_score 恒为 None），"结果相不相关"就再没有任何机制在判断，
+        # 负例直接被送进 LLM 硬答。dense 距离与 rerank 无关、量纲稳定。
+        # 50 条评测集实测（2026-09-30）：正例 top1 距离 0.390~0.890，
+        # 负例 0.592~1.087。
+        # 阈值取 0.95（不是 0.85）：0.85 会把「肥而不腻的经典川菜」(0.890)、
+        # 「宝宝睡眠和安全」(0.882) 等比负例还"像负例"的正例一起标掉，
+        # 实测导致正例被误拒（5/5 → 3/5），而负例拒答并没有变好
+        # —— 那些负例本来就已被 prompt 的「作答前自检」拦住了，属于无增量
+        # 收益的纯副作用。0.95 只兜底"检索彻底答非所问"的极端情况，
+        # 正例零误伤（正例最高 0.890）。
+        self.crag_dense_dist = float(
+            cfg.get("retrieval.crag.dense_low_conf_dist", 0.95))
         self._reranker = None
         self._table = None
         self._bm25 = None  # CorpusBM25(懒加载,行数变化自动重建)
@@ -251,6 +266,10 @@ class Retriever:
         hits = tbl.search(qvec).limit(top_k_in).to_list()
         if not hits:
             return [], None
+        # dense top1 距离：低置信判据的唯一可信来源，必须在 RRF 融合前取
+        # （融合会按融合分重排，融合后的 top1 未必还是 dense 的 top1）
+        _d = hits[0].get("_distance")
+        dense_top1_dist = float(_d) if _d is not None else None
 
         # 2.5) hybrid: 与 BM25 结果做 RRF 融合(关键词精确命中常在 OCR 噪声 chunk
         #      里被向量检索埋掉;失败/不可用一律退回纯向量,不影响检索)
@@ -294,7 +313,19 @@ class Retriever:
                 "url": self._note_url(hit["note_id"]),
             })
         results = self._complete_note_chunks(hits, results)
-        # 关闭 rerank 时没有可信分数: 返回 None 让 CRAG 自评不生效。
+        # ── 低置信标记（CRAG-lite 的可见产物）────────────────────────
+        # 语义：库里最贴近这条 query 的内容，距离都还很远 → 大概率"同领域但不
+        # 回答这个问题"。标记会一路传到生成端：answer.build_messages 据此追加
+        # 「本次检索置信度低」的 system 提示，让模型走"作答前自检"从严拒答。
+        # 注意别和上面的 crag 改写重检混为一谈 —— 那个是"换个词再找一次"，
+        # 这个是"告诉模型这次可能真没有"。
+        if (dense_top1_dist is not None and results
+                and dense_top1_dist > self.crag_dense_dist):
+            results[0]["low_confidence"] = True
+            logger.info(f"检索低置信(dense top1 dist={dense_top1_dist:.3f} "
+                        f"> {self.crag_dense_dist}): {query[:40]}")
+        # 关闭 rerank 时没有 rerank 可信分数: 返回 None 让 CRAG 的"改写重检"
+        # 自评不生效（低置信已改由上面的 dense 距离标记承载）。
         # 不能拿占位的 0.0 去比 min_top1_score —— 0.0 < 0.75 会被判
         # low_conf, 导致每条 query 都白跑一次 LLM 改写重检。
         top_score = results[0]["score"] if (results and self.rerank_enabled) else None

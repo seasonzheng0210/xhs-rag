@@ -217,12 +217,14 @@ ocr:
 # 索引与检索
 # ────────────────────────────────────────────────────────────
 embedding:
-  backend: api                         # ★ 固定 api，见 项目计划.md §0.4
+  backend: api                         # ⚠️ 死配置：代码从未读取，实际恒走 local（2026-09-30 复核）
   local:
     model: BAAI/bge-m3
-    device: cpu                        # 940M 2GB 放不下 FP32(2.28GB)，Maxwell FP16 不提速
-    batch_size: 8
-    max_length: 8192
+    device: auto                       # 建索引：auto=有 CUDA 用 GPU；设 cuda 则无 GPU 直接报错
+    query_device: cpu                  # 在线查询：serve/mcp 常驻，走 CPU 省显存
+    batch_size: 32                     # 省略则按设备自动（GPU 32 / CPU 8）
+    torch_threads: 4                   # 仅 CPU 模式生效
+    max_length: 1024                   # chunk 上限 800 字符，1024 token 足够
   api:
     provider: siliconflow              # siliconflow | bailian | zhipu
     model: BAAI/bge-m3                 # 免费
@@ -254,10 +256,19 @@ retrieval:
   crag:                                # CRAG-lite: 低置信自动改写重检一次
     enabled: true
     min_top1_score: 0.75               # normalize 后 sigmoid 分数, 实测标定
+                                       # ⚠️ 仅 rerank 开启时生效
+    dense_low_conf_dist: 0.95          # ★ rerank 关闭时的低置信判据:
+                                       # dense top1 距离(越小越像)。
+                                       # 正例 0.39~0.89 / 负例 0.59~1.09(50条实测)。
+                                       # ⚠️ 别取 0.85 —— 会把 0.89/0.88 这些
+                                       # 比负例还像负例的正例一起标掉，实测正例
+                                       # 误拒(5/5→3/5) 且负例无改善，纯副作用。
+                                       # 0.95 兜底极端情况，正例零误伤。
 
 rerank:
   enabled: true                        # ★ 强烈建议开启，性价比最高
-  backend: api                         # ★ 固定 api：本地 15-25 秒/查询不可接受
+  backend: api                         # ⚠️ 死配置：代码只读 rerank.local.model，
+                                       #    api.* 组从未生效（2026-09-30 grep 复核）
   local:
     model: BAAI/bge-reranker-v2-m3
     device: cpu

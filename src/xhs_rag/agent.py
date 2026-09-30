@@ -48,10 +48,13 @@ AGENT_SYSTEM = """你是「收藏夹 RAG」的智能体，回答用户关于他�
 2. 每步看结果决定下一步：信息不够就换关键词或换子主题再搜；某篇笔记是关键来源就读原文。
 3. 已有足够信息就停止调工具，给最终回答——不要为用工具而用工具。
 4. 最终回答用中文，先结论后展开，依据工具返回内容并标注来源笔记标题，不编造。
-5. 收藏夹确实没有的内容，如实说明，不要脑补。
+5. 收藏夹确实没有的内容，如实说明，不要脑补。注意：片段"属于同一领域"不等于
+   "回答了这个问题"——问「宝宝发烧怎么物理降温」而片段只讲「带娃偏方/出门时长」，
+   属于没有内容，必须拒答。宁可少答，不可硬答。
 6. 调用工具必须走 function calling 工具调用接口，禁止把工具调用写成文字内容。
 7. 收藏夹里确实没有相关内容时，直接说明「收藏夹里没有找到相关内容」即可，不要编造内容，
-   也不要推荐外部网站/链接/教程渠道（搜索词与网址同理，一律不许编）。"""
+   也不要推荐外部网站/链接/教程渠道（搜索词与网址同理，一律不许编）。
+8. 引用编号只能挂在片段原文确实写了的内容上，禁止把自己的知识写成答案再贴引用编号。"""
 
 # OpenAI function calling 工具声明（与 RAGAgent._exec_tool 分发一一对应）
 TOOLS_SPEC = [
@@ -112,6 +115,9 @@ class RAGAgent:
         self.session = session  # M11 记忆采集标签(cli/mcp)；空=非用户会话，不落盘
         self._ctx: dict | None = None
         self._graph = None
+        # 供 Web UI 渲染引用卡片的原始检索结果（最近一次 search 工具的输出）。
+        # 与返回给 LLM 的精简 JSON 分开存：UI 需要 score/note_id，LLM 不需要。
+        self._ui_hits: list[dict] = []
         from .qa.answer import Answerer
         self._ans = Answerer(cfg)  # 只借 base_url/model/headers/_payload
 
@@ -180,6 +186,13 @@ class RAGAgent:
     def _tool_search(self, query: str, k: int = 5) -> str:
         ctx = self._get_ctx()
         results = ctx["retriever"].search(query.strip(), k=int(k))
+        # 顺手留一份给 Web UI 渲染引用卡片（比给 LLM 的那份多 score/section）
+        self._ui_hits = [
+            {"note_id": r["note_id"], "title": r.get("title", ""),
+             "section": r.get("section", ""),
+             "text": (r.get("text") or "")[:300],
+             "score": round(float(r.get("score") or 0), 2)}
+            for r in results]
         out = [{"note_id": r["note_id"], "title": r.get("title", ""),
                 "text": (r.get("text") or "")[:300]} for r in results]
         return json.dumps({"count": len(out), "results": out},
@@ -359,9 +372,16 @@ class RAGAgent:
         return self._graph
 
     # ── 对外入口（签名与 v1 一致）────────────────────────────────
-    def run(self, query: str) -> dict:
-        """跑一个决策循环，返回 {answer, steps, tool_calls, secs[, hit_limit]}。"""
-        t0 = time.time()
+    @staticmethod
+    def _arg_brief(args: dict | None, limit: int = 40) -> str:
+        """把工具参数压成一句人类可读的短串（Web 前端显示进度用）。"""
+        if not args:
+            return ""
+        s = "、".join(f"{k}={str(v)[:20]}" for k, v in args.items())
+        return s[:limit]
+
+    def _prepare(self, query: str) -> tuple[list[dict], AgentState]:
+        """构造初始消息与 state。run() 与 stream() 共用，保证两者行为一致。"""
         # M11: 记忆背景注记作为第二条 system 消息注入(空则不加)，放在
         # 决策循环最前面 → 后续每轮 _chat 都带着它，无需逐节点重复拼。
         msgs: list[dict] = [{"role": "system", "content": AGENT_SYSTEM}]
@@ -369,15 +389,64 @@ class RAGAgent:
         if note:
             msgs.append({"role": "system", "content": note})
         msgs.append({"role": "user", "content": query})
-        self._log_dialog("user", query)
         init: AgentState = {
             "messages": msgs,
             "pending": [], "trace": [], "steps": 0,
             "answer": "", "hit_limit": False,
         }
+        return msgs, init
+
+    def stream(self, query: str):
+        """流式版决策循环：逐节点产出进度，最后给出最终结果。
+
+        产出 (kind, payload)：
+          ("step",  {"steps": n, "name": "llm"|"tools",
+                     "detail": "人类可读的一行", "hits": [...]})
+          ("final", {answer, steps, tool_calls, secs[, hit_limit]})
+
+        存在的意义：Agent 一轮要 30-60 秒。Web 端若只能等最终结果，用户
+        就得对着白屏干等；逐节点推送让前端能显示「第 2 步：调用 search」。
+        """
+        t0 = time.time()
+        _, init = self._prepare(query)
+        self._log_dialog("user", query)
         # 预热 ctx（主线程，避免 Windows worker 线程加载模型死锁）
         self._get_ctx()
-        final = self._graph_build().invoke(init)
+        final_state: AgentState | None = None
+        prev_steps = 0
+        prev_trace = 0
+        for st in self._graph_build().stream(init, stream_mode="values"):
+            final_state = st
+            steps = int(st.get("steps") or 0)
+            trace = st.get("trace") or []
+            # 步数推进 = llm 节点刚决策完
+            if steps > prev_steps:
+                pending = st.get("pending") or []
+                if pending:
+                    names = "、".join(
+                        (c.get("function") or {}).get("name", "?")
+                        for c in pending)
+                    detail = f"第 {steps} 步：决定调用 {names}"
+                else:
+                    detail = f"第 {steps} 步：信息已足够，开始作答"
+                yield ("step", {"steps": steps, "name": "llm",
+                                "detail": detail, "hits": []})
+                prev_steps = steps
+            # trace 变长 = tools 节点刚跑完
+            if len(trace) > prev_trace:
+                for tr in trace[prev_trace:]:
+                    brief = self._arg_brief(tr.get("args"))
+                    is_search = tr.get("tool") == "search"
+                    yield ("step", {
+                        "steps": tr.get("step", steps), "name": "tools",
+                        "detail": f"执行 <b>{tr.get('tool')}</b>"
+                                  + (f"（{brief}）" if brief else "")
+                                  + f" → {tr.get('out_chars', 0)} 字符",
+                        "hits": list(self._ui_hits) if is_search else [],
+                    })
+                prev_trace = len(trace)
+
+        final = final_state or init
         answer = final.get("answer") or ""
         if not answer:  # 自然结束但 answer 为空时兜底取最后 assistant 文本
             for m in reversed(final["messages"]):
@@ -385,9 +454,21 @@ class RAGAgent:
                     answer = m["content"].strip()
                     break
         self._log_dialog("assistant", answer)
-        out = {"answer": answer, "steps": final["steps"],
-               "tool_calls": final["trace"],
+        out = {"answer": answer, "steps": final.get("steps", 0),
+               "tool_calls": final.get("trace") or [],
                "secs": round(time.time() - t0, 1)}
         if final.get("hit_limit"):
             out["hit_limit"] = True
+        yield ("final", out)
+
+    def run(self, query: str) -> dict:
+        """跑一个决策循环，返回 {answer, steps, tool_calls, secs[, hit_limit]}。
+
+        实现改为消费 stream() 取最后一项 —— 决策逻辑只有一份，
+        避免流式/非流式两条路径行为漂移。
+        """
+        out: dict = {}
+        for kind, payload in self.stream(query):
+            if kind == "final":
+                out = payload
         return out

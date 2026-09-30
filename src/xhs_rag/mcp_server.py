@@ -11,13 +11,19 @@
 然后在本模块目录用 `python -m xhs_rag.cli mcp` 也能直接以 stdio 跑。
 
 工具：
-  - search(query, k=5)  语义检索收藏夹，返回带原帖链接的结果列表
-  - ask(query)          检索 + LLM 生成带引用的回答（LLM 不可用时退化为 search；
-                        自动注入 M11 长期记忆背景注记，并把本轮问答落盘供离线 digest）
-  - stats()             收藏库统计（笔记/图片/视频/ASR 字符/chunks）
+  - search(query, k=5, image="")  语义检索，返回带原帖链接的结果列表
+  - ask(query, image="")          检索 + LLM 单跳生成带引用的回答（LLM 不可用时
+                                  退化为 search；自动注入 M11 长期记忆背景注记，
+                                  并把本轮问答落盘供离线 digest）
+  - agent(query, image="")        M10 多步循环（最多 8 步；更准但慢 3-5 倍）
+  - stats()                       收藏库统计（笔记/图片/视频/ASR 字符/chunks）
+
+  image 传图片的本地绝对路径，会先 OCR 图中文字再并入检索词
+  （与 CLI 的 `--image`、Web 的传图入口共用同一套 OcrEngine）。
 
 模型在 mcp.run() 前的主线程预热（约 10-20s，与 web serve 同策略），工具调用即时返回。
 ⚠️ 不要在 MCP 工具线程内懒加载模型 —— Windows 上会死等挂起，预热必须发生在主线程。
+   OCR 引擎同理，见 main() 里的 OcrEngine.warmup()。
 """
 from __future__ import annotations
 
@@ -107,32 +113,64 @@ def _trim(r: dict, n: int = 400) -> dict:
     return out
 
 
-def _tool_search(query: str, k: int = 5) -> str:
-    if not query.strip():
-        return json.dumps({"error": "query 不能为空"}, ensure_ascii=False)
+def _apply_image(cfg: Config, image: str, query: str) -> tuple[str, str | None]:
+    """image 非空时，把它 OCR 出的文字并入 query。返回 (新 query, 错误信息)。
+
+    语义与 CLI 的 `--image` 保持一致：**合并**而非替换 —— 截图里的正文
+    往往比用户手打的关键词更完整，两者一起检索召回更好。
+    """
+    from .process.ocr import ocr_image_to_query
+
+    info = ocr_image_to_query(cfg, image)
+    if not info:
+        return query, "图片没有识别出可用文字（或文件不存在/读取失败）"
+    q = query.strip()
+    return (f"{q} {info['text']}".strip() if q else info["text"])[:300], None
+
+
+def _tool_search(query: str, k: int = 5, image: str = "") -> str:
+    if not query.strip() and not image.strip():
+        return json.dumps({"error": "query 与 image 至少要给一个"},
+                          ensure_ascii=False)
     ctx = _get_ctx()
+    from_image = False
+    if image.strip():
+        query, err = _apply_image(ctx["cfg"], image.strip(), query)
+        if err:
+            return json.dumps({"error": err}, ensure_ascii=False)
+        from_image = True
     t0 = time.time()
     results = _enrich(ctx["retriever"].search(query.strip(), k=k))
-    return json.dumps({
+    out = {
         "query": query.strip(),
         "secs": round(time.time() - t0, 1),
         "count": len(results),
         "results": [_trim(r) for r in results],
-    }, ensure_ascii=False, indent=2)
+    }
+    if from_image:
+        out["from_image"] = True
+    return json.dumps(out, ensure_ascii=False, indent=2)
 
 
 def _tool_ask(query: str, history: list[dict] | None = None,
-              record: bool = True) -> str:
+              record: bool = True, image: str = "") -> str:
     """record=False 时不把本轮对话写进长期记忆。
+
+    image 非空时先 OCR 成文字并并入 query（查询端多模态，同 CLI `--image`）。
 
     调用方语义：MCP 工具入口（真人问）用默认 True；Agent 的 ask 工具
     按父会话决定 —— 非用户会话（脚本/评测）必须传 False，否则
     test_agent_cases 之类的回归会把测试问答当用户对话写进 dialog_log，
     下一个 digest 就把它摘要成"用户偏好"（2026-09-16 实测踩到过）。
     """
-    if not query.strip():
-        return json.dumps({"error": "query 不能为空"}, ensure_ascii=False)
+    if not query.strip() and not image.strip():
+        return json.dumps({"error": "query 与 image 至少要给一个"},
+                          ensure_ascii=False)
     ctx = _get_ctx()
+    if image.strip():
+        query, err = _apply_image(ctx["cfg"], image.strip(), query)
+        if err:
+            return json.dumps({"error": err}, ensure_ascii=False)
     q = query.strip()
     # 多轮: 追问式 query 先结合历史改写成独立检索词(history 由客户端传入)
     history = [h for h in (history or [])
@@ -184,6 +222,40 @@ def _tool_ask(query: str, history: list[dict] | None = None,
         logger.warning(f"AI 回答失败: {e}")
         out["answer"] = f"（AI 回答失败：{e}）检索到以下内容，请自行查阅。"
     return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+def _tool_agent(query: str, image: str = "") -> str:
+    """跑一次 M10 LangGraph Agent 多步循环，返回答案 + 执行轨迹。
+
+    与 ask 的区别：ask 是单跳（检索 → 生成）；agent 会自己决定检索几次、
+    要不要精读某篇笔记、要不要补充检索，最多 8 步，步数耗尽有 finalize
+    兜底。适合「跨多篇笔记汇总」「对比几篇」「先在库里找再回答」这类问题。
+
+    ⚠️ 代价：每次多 2-4 次 LLM 调用，耗时通常是 ask 的 3-5 倍（30-90s）。
+    客户端应把工具超时放宽到 ≥120s。
+    """
+    if not query.strip() and not image.strip():
+        return json.dumps({"error": "query 与 image 至少要给一个"},
+                          ensure_ascii=False)
+    ctx = _get_ctx()
+    if image.strip():
+        query, err = _apply_image(ctx["cfg"], image.strip(), query)
+        if err:
+            return json.dumps({"error": err}, ensure_ascii=False)
+    from .agent import RAGAgent
+
+    # session="mcp" → 本轮问答落盘供离线 digest（与 _tool_ask 同口径）；
+    # 注意不能留空，否则 Agent 会认为"非用户会话"而不写记忆。
+    agent = RAGAgent(ctx["cfg"], verbose=False, session="mcp")
+    out = agent.run(query.strip())
+    return json.dumps({
+        "query": query.strip(),
+        "answer": out.get("answer", ""),
+        "steps": out.get("steps", 0),
+        "hit_limit": bool(out.get("hit_limit")),
+        "tools": out.get("tool_calls", []),
+        "secs": out.get("secs", 0),
+    }, ensure_ascii=False, indent=2)
 
 
 def _tool_stats() -> str:
@@ -239,24 +311,40 @@ def main() -> int:
 
     mcp = FastMCP("xhs-rag", instructions=(
         "用户的小红书收藏夹知识库。search 检索收藏内容(带原帖链接); "
-        "ask 基于检索做 LLM 问答(答案带 [n] 引用, 对应 results 下标); "
-        "stats 查库统计。回答请优先依据 ask 返回的 results, 不要编造。"))
+        "ask 基于检索做单跳 LLM 问答(答案带 [n] 引用, 对应 results 下标); "
+        "agent 走多步循环，适合跨多篇笔记汇总/对比类问题(更准但慢 3-5 倍); "
+        "stats 查库统计。search/ask/agent 都支持 image 参数传图片本地路径"
+        "(先 OCR 图中文字再检索)。回答请优先依据返回的 results, 不要编造。"))
 
-    @mcp.tool(description="语义检索小红书收藏夹，返回带原帖链接的结果列表")
-    def search(query: str, k: int = 5) -> str:
+    @mcp.tool(description="语义检索小红书收藏夹，返回带原帖链接的结果列表。"
+                          "image 可传图片的本地绝对路径，会先 OCR 图中文字"
+                          "再与 query 合并检索（query 与 image 至少给一个）")
+    def search(query: str = "", k: int = 5, image: str = "") -> str:
         try:
-            return _tool_search(query, k)
+            return _tool_search(query, k, image)
         except Exception as e:
             return json.dumps({"error": f"search 失败: {e}"}, ensure_ascii=False)
 
     @mcp.tool(description="基于收藏夹做 LLM 问答：检索 + 生成带引用的回答。"
                           "多轮对话时传 history=[{role,content},...]（本轮之前的对话），"
-                          "追问会被自动改写成独立检索词")
-    def ask(query: str, history: list[dict] | None = None) -> str:
+                          "追问会被自动改写成独立检索词。"
+                          "image 可传图片本地绝对路径，先 OCR 图中文字再一并提问")
+    def ask(query: str = "", history: list[dict] | None = None,
+            image: str = "") -> str:
         try:
-            return _tool_ask(query, history)
+            return _tool_ask(query, history, True, image)
         except Exception as e:
             return json.dumps({"error": f"ask 失败: {e}"}, ensure_ascii=False)
+
+    @mcp.tool(description="Agent 多步问答（M10）：会自己决定检索几次、精读哪篇笔记，"
+                          "最多 8 步。适合「跨多篇笔记汇总/对比」类问题，比 ask 更准"
+                          "但慢 3-5 倍（30-90 秒，请把工具超时放宽到 ≥120 秒）。"
+                          "image 可传图片本地绝对路径，先 OCR 图中文字再提问")
+    def agent(query: str = "", image: str = "") -> str:
+        try:
+            return _tool_agent(query, image)
+        except Exception as e:
+            return json.dumps({"error": f"agent 失败: {e}"}, ensure_ascii=False)
 
     @mcp.tool(description="收藏库统计：笔记数/图片数/视频数/ASR 字符/chunks")
     def stats() -> str:
@@ -269,6 +357,20 @@ def main() -> int:
     # 线程执行的，实测在 worker 线程内首次 import torch / 加载 bge-m3 会
     # 死等挂起（0 CPU、内存停在 ~150MB）；主线程预热仅需 8-12s。
     # 即使预热失败也继续启动 server，让工具返回可读错误而不是裸崩。
+    # 传图检索用的 OCR 引擎同样必须在主线程预热：MCP 工具跑在 anyio worker
+    # 线程里，在那里首次加载 RapidOCR / onnxruntime 会死等挂起（0 CPU）。
+    try:
+        from .process.ocr import shared_ocr_engine
+
+        _t0 = time.time()
+        # 走共享实例：工具里的 ocr_image_to_query 复用同一引擎，
+        # 避免每次传图都重新加载一次 RapidOCR（3–15s）。
+        _ocr_ok = shared_ocr_engine(load_config()).warmup()
+        _logger.info(f"OCR 引擎预热{'完成' if _ocr_ok else '失败(降级为云端 API)'}"
+                     f", 耗时 {time.time() - _t0:.0f}s")
+    except Exception as e:
+        _logger.warning(f"OCR 预热失败(传图检索将不可用): {e}")
+
     global _ctx, _build_failed
     try:
         _ctx = _build_ctx(load_config())

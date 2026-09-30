@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -29,21 +30,36 @@ class OcrEngine:
         self._rapid: Any | None = None
         self._started_at = time.time()
         self._api_calls = 0
+        self._lock = threading.Lock()  # 并发首次加载保护（Web/MCP 会多线程进来）
 
     # ── 本地 RapidOCR ────────────────────────────────────
     def _load_rapid(self) -> Any | None:
         if self._rapid is not None:
             return self._rapid
-        try:
-            from rapidocr_onnxruntime import RapidOCR
+        # 双重检查：并发情况下只让一个线程真的构造 RapidOCR（要 3–15s）
+        with self._lock:
+            if self._rapid is not None:
+                return self._rapid
+            try:
+                from rapidocr_onnxruntime import RapidOCR
 
-            self._rapid = RapidOCR()
-            logger.info("RapidOCR 本地引擎加载完成(CPU)")
-            return self._rapid
-        except Exception as e:
-            logger.warning(f"RapidOCR 加载失败,降级为纯 API 模式: {e}")
-            self._rapid = False  # 缓存失败状态,避免反复尝试
-            return None
+                self._rapid = RapidOCR()
+                logger.info("RapidOCR 本地引擎加载完成(CPU)")
+                return self._rapid
+            except Exception as e:
+                logger.warning(f"RapidOCR 加载失败,降级为纯 API 模式: {e}")
+                self._rapid = False  # 缓存失败状态,避免反复尝试
+                return None
+
+    def warmup(self) -> bool:
+        """主动加载本地引擎，供常驻服务（serve）在主线程预热。
+
+        ⚠️ 必须在主线程调用：Windows 上在工作线程里首次 import onnxruntime
+        / 实例化 RapidOCR 会死等挂起（同 mcp_server 顶部的说明），而 Web 的
+        HTTP handler 恰好跑在 worker 线程 —— 所以加载要说在前头做掉。
+        返回是否可用；失败不抛异常（自动降级为纯 API 模式）。
+        """
+        return bool(self._load_rapid())
 
     def ocr_local(self, img_path: Path) -> dict | None:
         """本地识别,返回 {text, confidence} 或 None(失败/无文本)。
@@ -366,3 +382,97 @@ class OcrProcessor:
             f"{stats['skip']} 图跳过, VLM 兜底 {stats['vlm']} 次"
         )
         return stats
+
+
+# ── 进程级共享 OCR 引擎 ──────────────────────────────────────
+# 实例化 RapidOCR 要 3–15s（onnxruntime 建会话 + 读模型）。serve / mcp 这类
+# 常驻进程若每次传图都 new 一个 OcrEngine，这段开销就每张图重付一遍 ——
+# 而且加载恰好发生在 HTTP worker 线程里，正是 Windows 上最容易死等的路径。
+# 因此查询端引擎按进程共享：预热一次，CLI / Web / MCP 三条入口全程复用。
+_SHARED_ENGINE: OcrEngine | None = None
+_SHARED_LOCK = threading.Lock()
+
+
+def shared_ocr_engine(cfg: Config) -> OcrEngine:
+    """取进程级共享的 OcrEngine（首次调用创建，之后复用同一实例）。
+
+    Web 的 ThreadingHTTPServer 会并发进 handler，MCP 也可能并发调工具，
+    所以首次创建加锁，避免重复构造 RapidOCR。
+    """
+    global _SHARED_ENGINE
+    if _SHARED_ENGINE is None:
+        with _SHARED_LOCK:
+            if _SHARED_ENGINE is None:
+                _SHARED_ENGINE = OcrEngine(cfg)
+    return _SHARED_ENGINE
+
+
+def ocr_image_to_query(cfg: Config, image: str) -> dict | None:
+    """把一张图 OCR 成可检索文本（查询端多模态，三条入口共用）。
+
+    image 支持两种形式：
+      - 本地文件路径         （CLI `--image` / MCP 工具的 image 参数）
+      - data:image/*;base64,…（Web 前端上传的截图）
+
+    复用采集侧同一套 OcrEngine（本地 RapidOCR 优先、命中 escalate 才上云
+    VLM 兜底），所以三条入口不需要各自准备 OCR 依赖。
+
+    引擎取自进程级共享实例（shared_ocr_engine）：RapidOCR 只加载一次，
+    常驻服务不会因为第二张图再等 3–15s。
+
+    ⚠️ 调用方仍应保证共享引擎已在**主线程**预热（见 OcrEngine.warmup）：
+    Windows 上在 worker 线程里首次加载推理引擎会死等挂起，而 MCP 工具与
+    Web 的 HTTP handler 都跑在工作线程里。
+
+    返回 {"text","engine","confidence","secs","source"}；
+    图片不存在 / 无可用文字 / 识别失败时返回 None。
+    """
+    t0 = time.time()
+    tmp: Path | None = None
+    try:
+        if image.startswith("data:image/"):
+            if "," not in image:
+                logger.error("data URL 缺少 base64 内容")
+                return None
+            raw = base64.b64decode(image.split(",", 1)[1])
+            if not raw:
+                logger.error("图片内容为空")
+                return None
+            up_dir = cfg.path("paths.data_dir") / "tmp" / "upload"
+            up_dir.mkdir(parents=True, exist_ok=True)
+            tmp = up_dir / f"query_{int(time.time() * 1000)}.jpg"
+            tmp.write_bytes(raw)
+            p, source = tmp, "upload"
+        else:
+            p = Path(image).expanduser()
+            source = "path"
+            if not p.exists():
+                logger.error(f"图片不存在：{p}")
+                return None
+
+        res = shared_ocr_engine(cfg).ocr_image(p)
+        text = (res or {}).get("text") or ""
+        # OCR 是多行的，检索词要压成单行并去掉过短噪声行
+        lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) >= 2]
+        query = " ".join(lines).strip()[:300]
+        if not query:
+            logger.warning(f"图片没识别出可用文字：{getattr(p, 'name', '')}")
+            return None
+        out = {"text": query,
+               "engine": (res or {}).get("engine", ""),
+               "confidence": round(float((res or {}).get("confidence") or 0), 2),
+               "secs": round(time.time() - t0, 1),
+               "source": source}
+        logger.info(f"图片检索词（{out['engine']} / conf="
+                    f"{out['confidence']:.2f} / {out['secs']}s）："
+                    f"{query[:80]}")
+        return out
+    except Exception as e:
+        logger.error(f"图片 OCR 失败：{e}")
+        return None
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink()  # 上传件识别完即删
+            except Exception:
+                pass

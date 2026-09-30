@@ -30,9 +30,12 @@ index = [
     "pyarrow>=16.0",
     "jieba>=0.42",
 ]
-# ★ 本地 embedding/rerank 还需要 torch(CPU) + flagembedding + modelscope，未写入依赖：
-#   torch 分平台（CPU/CUDA），写死会拉 ~2.5GB CUDA 版。按环境手动装：
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# ★ 本地 embedding/rerank 还需要 torch + flagembedding + modelscope，未写入依赖：
+#   torch 分平台（CPU/CUDA），写死会强制拉 ~2.5GB CUDA 版。按环境手动装：
+#     CPU 环境（省磁盘，索引慢）：pip install torch --index-url https://download.pytorch.org/whl/cpu
+#     CUDA 环境（索引快 5-8 倍，需 ~3GB）：pip install torch==2.14.0+cu130 --index-url https://download.pytorch.org/whl/cu130
+#   ⚠️ 一定要与项目 torch 版本号对齐（2.14.0），只换 build 后缀，避免连带降级。
+#   装完用 `cli doctor` 或 embedding.device=auto 自检；device=cuda 时无 GPU 会直接报错。
 #   pip install flagembedding modelscope
 #   模型文件（bge-m3 / bge-reranker-v2-m3）在 data/models/ 随数据迁移，不属 pip 管。
 # M6 起：Web UI（标准库 http.server 实现，零额外依赖）
